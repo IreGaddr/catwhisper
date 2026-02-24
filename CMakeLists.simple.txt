@@ -1,0 +1,44 @@
+cmake_minimum_required(VERSION 3.20)
+
+project(catwhisper_tests CXX)
+set(CMAKE_CXX_STANDARD 20)
+
+# Find dependencies
+find_package(Vulkan REQUIRED)
+find_package(VulkanMemoryAllocator REQUIRED)
+find_package(GTest REQUIRED)
+
+# Library
+add_library(catwhisper
+    src/core/context.cpp
+    src/gpu/buffer.cpp
+    src/gpu/pipeline.cpp
+    src/indexes/index_flat.cpp
+)
+
+target_include_directories(catwhisper
+    PUBLIC include
+    PRIVATE src
+)
+
+target_link_libraries(catwhisper
+    PUBLIC Vulkan::Vulkan VulkanMemoryAllocator::VulkanMemoryAllocator
+)
+
+# Tests
+file(GLOB TEST_SOURCES tests/unit/*.cpp tests/integration/*.cpp)
+add_executable(catwhisper_tests ${TEST_SOURCES})
+
+target_link_libraries(catwhisper_tests
+    PRIVATE catwhisper GTest::gtest GTest::gtest_main
+)
+
+include(GoogleTest)
+gtest_discover_tests(catwhisper_tests)
+
+# Examples
+add_executable(basic_example examples/basic_example.cpp)
+target_link_libraries(basic_example PRIVATE catwhisper)
+
+add_executable(benchmark examples/benchmark.cpp)
+target_link_libraries(benchmark PRIVATE catwhisper)

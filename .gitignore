@@ -1,0 +1,75 @@
+# Build directories
+.build/
+build/
+cmake-build-*/
+out/
+
+# IDE/Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Compiled shaders
+*.spv
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+*.cmake.in
+
+# Compiled libraries
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.lib
+
+# Compiled executables
+*.exe
+*.out
+*.app
+
+# Object files
+*.o
+*.obj
+*.ko
+*.elf
+
+# Precompiled headers
+*.gch
+*.pch
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Profiling
+*.prof
+*.perf
+callgrind.out.*
+cachegrind.out.*
+
+# Testing
+coverage/
+*.gcda
+*.gcno
+*.gcov
+
+# Package managers
+conan.lock
+vcpkg_installed/
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.bak
