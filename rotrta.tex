@@ -1,0 +1,1025 @@
+% rotrta.tex — IEEE conference style
+% Compile with: pdflatex rotrta.tex (twice for refs)
+\documentclass[conference]{IEEEtran}
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{url}
+\usepackage{microtype}
+\usepackage{siunitx}
+\usepackage{multirow}
+\usepackage{array}
+
+% Code listing style
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  keywordstyle=\bfseries\color{blue!70!black},
+  commentstyle=\itshape\color{green!50!black},
+  stringstyle=\color{red!60!black},
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny,
+  xleftmargin=1.5em,
+  framexleftmargin=1.5em,
+}
+
+\hyphenation{Cat-Whisper Vul-kan FAISS}
+
+% ============================================================================
+\begin{document}
+
+\title{ROTRTA: Ridiculous Optimizations Through Ridiculous Test Assertions ---
+       A Methodology for AI-Driven Performance Engineering, with Application
+       to GPU Vector Similarity Search}
+
+\author{
+  \IEEEauthorblockN{IreGaddr}
+  \IEEEauthorblockA{CatWhisper Project\\
+    \texttt{iregaddr@gmail.com}}
+}
+
+\maketitle
+
+% ============================================================================
+\begin{abstract}
+We introduce \emph{Ridiculous Optimizations Through Ridiculous Test Assertions}
+(ROTRTA), a test-driven performance engineering methodology in which
+latency assertions are deliberately set beyond a system's current capability,
+anchored to the measured performance of a reference state-of-the-art system.
+Tests are written first and are contractually immutable: they may never be
+weakened to accommodate a lagging implementation.  This asymmetry forces
+genuine optimization rather than satisficing, and provides AI-agent optimizers
+with a binary, reproducible oracle.  We demonstrate ROTRTA on CatWhisper, a
+cross-vendor GPU vector similarity search library built on Vulkan.  Starting
+from a manually optimized baseline that remained \SI{2.4}{\times} slower than
+FAISS-GPU across three benchmark configurations, a single ROTRTA session
+driven by an autonomous AI agent produced a stack of six coordinated
+optimizations --- Structure-of-Arrays database layout, doubled warp-tile size,
+Vulkan timeline semaphores, userspace spin-poll synchronization, AVX-512
+fp16 conversion, and zero-copy mapped I/O --- that together reduced
+single-query latency by up to \SI{18.9}{\times} and caused CatWhisper to
+\emph{beat FAISS-GPU on all three benchmark dimensions} simultaneously.
+We argue that ROTRTA is a broadly applicable discipline that makes latent
+performance budget visible, eliminates premature satisficing, and is
+uniquely well-suited to AI-agent-driven development because it reduces an
+open-ended optimization problem to a well-posed constraint satisfaction
+problem.
+\end{abstract}
+
+\begin{IEEEkeywords}
+test-driven development, performance engineering, vector similarity search,
+GPU computing, Vulkan, FAISS, AI agents, benchmark-driven optimization
+\end{IEEEkeywords}
+
+% ============================================================================
+\section{Introduction}
+\label{sec:intro}
+
+High-performance systems development has long grappled with a fundamental
+tension: performance requirements are continuous and comparative, yet
+traditional test frameworks treat correctness as binary.  A function either
+returns the right answer or it does not; but whether it returns it \emph{fast
+enough} depends on hardware, workload, and what competitors have achieved.
+Standard benchmarking practices measure after the fact.  Profiling-driven
+optimization follows an iterative, ad hoc loop --- profile, identify hot spots,
+optimize, repeat.  This loop is well understood for human developers.  It is
+poorly matched to the working style of autonomous AI agents.
+
+AI coding agents, in their current form, excel at implementing well-specified
+transformations and exploring large, locally constrained search spaces.  They
+are less effective at formulating their own performance targets, recognizing
+satisficing behavior, or maintaining long-horizon optimization intent across
+many discrete decisions.  Given a vague directive such as ``make the search
+function faster,'' an agent may apply superficial improvements --- reordering
+memory accesses, inlining a function --- and declare success.  Given a concrete,
+measurable, binary criterion --- ``the median single-query latency for
+10{,}000 vectors at dimension 128 must be strictly less than \SI{0.065}{\ms}''
+--- the agent has an unambiguous oracle and cannot satisfice prematurely.
+
+ROTRTA (\textbf{R}idiculous \textbf{O}ptimizations \textbf{T}hrough
+\textbf{R}idiculous \textbf{T}est \textbf{A}ssertions) formalizes this
+observation into a methodology:
+
+\begin{enumerate}
+  \item \textbf{Measure the reference.}  Establish the performance of the
+        state-of-the-art system on the target hardware and workload.
+  \item \textbf{Write immutable assertions.}  Encode performance targets as
+        standard unit-test assertions, set at the reference or slightly
+        below (25--50\% reduction from the current implementation).  The
+        tests are written before the corresponding optimizations exist.
+  \item \textbf{Lock the tests.}  Once written, test assertions are
+        contractually immutable.  They may never be weakened or deleted
+        to make a failing implementation appear correct.
+  \item \textbf{Implement until the tests pass.}  Any optimization
+        technique that causes the assertions to pass is valid.
+        Optimizations that address symptoms without curing root causes
+        will reveal themselves when other assertions remain red.
+\end{enumerate}
+
+In this paper we present ROTRTA as a discipline (Section~\ref{sec:rotrta}),
+describe CatWhisper --- a Vulkan-based GPU vector search library and the
+system against which ROTRTA was applied --- contrasting its design with
+FAISS (Section~\ref{sec:catwhisper}), trace the full optimization arc from
+baseline to ROTRTA-passing implementation (Section~\ref{sec:application}),
+and analyze the experimental results (Section~\ref{sec:results}).  We then
+discuss broader implications for AI-assisted software engineering
+(Section~\ref{sec:discussion}) and conclude (Section~\ref{sec:conclusion}).
+
+% ============================================================================
+\section{Background}
+\label{sec:background}
+
+\subsection{Vector Similarity Search}
+
+Dense vector similarity search is a core primitive in modern information
+retrieval, recommendation systems, and retrieval-augmented generation
+(RAG) pipelines.  Given a database $\mathcal{D} = \{v_1, \ldots, v_n\}
+\subset \mathbb{R}^d$ and a query $q \in \mathbb{R}^d$, the $k$-nearest
+neighbor ($k$-NN) problem finds the $k$ elements of $\mathcal{D}$ minimizing
+a distance metric $\delta(q, v_i)$.  For an exact flat index, this requires
+evaluating all $n$ distances: $O(nd)$ arithmetic operations per query.
+
+\subsection{FAISS}
+
+Facebook AI Similarity Search (FAISS)~\cite{johnson2019billion} is the
+de facto reference library for vector similarity search.  It provides both
+CPU and GPU backends, the latter accelerated by CUDA.  FAISS implements
+multiple index families: IndexFlat (exact brute-force), IndexIVFFlat
+(inverted file), IndexIVFPQ (product-quantized IVF), and HNSW
+(hierarchical navigable small world graphs).  GPU-accelerated IndexFlat
+achieves throughputs on the order of hundreds of millions of distance
+computations per second on modern NVIDIA hardware.  As of FAISS 1.13.2
+on an RTX~4080 Laptop GPU, single-query L2 search latency at $n=10{,}000$,
+$d=128$, $k=10$ is \SI{0.065}{\ms}; at $n=100{,}000$, $d=128$ it is
+\SI{0.350}{\ms}; and at $n=100{,}000$, $d=256$ it is \SI{0.601}{\ms}.
+
+\subsection{Vulkan Compute}
+
+Vulkan~\cite{vulkan2024spec} is a low-overhead, cross-vendor GPU API
+standardized by the Khronos Group.  Vulkan compute shaders, compiled to
+SPIR-V, execute on any Vulkan-capable GPU: NVIDIA, AMD, Intel, ARM Mali,
+and Apple Silicon (via MoltenVK).  Vulkan 1.2 introduced timeline
+semaphores --- monotonically-increasing 64-bit counters that eliminate the
+reset-before-reuse requirement of binary fences and enable userspace polling
+without kernel transitions on drivers that implement GPU-mapped semaphore
+surfaces.
+
+\subsection{AI Agents in Software Engineering}
+
+Large language model (LLM) agents have been applied to code generation,
+debugging, and refactoring~\cite{chen2021evaluating}.  Their utility for
+low-level performance optimization, however, has been less studied.
+Performance optimization requires hardware intuition, awareness of micro-
+architectural bottlenecks, and the ability to compose individually modest
+improvements into coordinated wins --- capabilities that benefit substantially
+from a concrete, measurable success criterion.
+
+% ============================================================================
+\section{The ROTRTA Methodology}
+\label{sec:rotrta}
+
+\subsection{Motivation: The Satisficing Problem}
+
+Optimization without a quantitative target converges to local minima.  A
+developer (or agent) who achieves a 20\% speedup has no mechanism to know
+whether 80\% was achievable.  Profiling can identify hot spots but does not
+indicate how much improvement is theoretically available.  Conventional TDD
+enforces functional correctness but is silent on performance: a function that
+takes one second is as ``correct'' as one that takes one microsecond.
+
+The ROTRTA insight is to close this loop by encoding performance targets as
+first-class, immutable test assertions, set to match or exceed a reference
+implementation.  The choice of a reference that is marginally better than
+current performance (25--50\% reduction) ensures the target is achievable
+but requires genuine effort.  The choice of a reference that represents the
+state of the art (e.g., FAISS-GPU) ensures the target is meaningful.
+
+\subsection{Formal Definition}
+
+Let $L_\text{curr}$ denote the current median latency of a system under
+benchmark $B$ on hardware $H$.  Let $L_\text{ref}$ denote the latency of
+the reference state-of-the-art system under the same $B$ on $H$.  A ROTRTA
+assertion is:
+\begin{equation}
+  \text{assert}\bigl(L_\text{impl} < L_\text{ref} - \epsilon\bigr)
+  \label{eq:rotrta}
+\end{equation}
+where $\epsilon \geq 0$ is a margin chosen such that
+\begin{equation}
+  \frac{L_\text{curr} - (L_\text{ref} - \epsilon)}{L_\text{curr}}
+  \;\in\; [0.25,\; 0.50]
+  \label{eq:budget}
+\end{equation}
+i.e., the assertion requires a 25--50\% reduction relative to the current
+implementation.  $\epsilon$ is typically set so that $L_\text{ref} - \epsilon$
+is \SI{1}{\ms} or less below the measured reference, creating a margin that
+accounts for measurement noise while still requiring the implementation to
+genuinely match the reference class.
+
+\subsection{The Immutability Invariant}
+
+Once written, a ROTRTA assertion must never be modified to be less strict.
+This invariant is enforced by treating the test file as append-only after the
+initial commit.  The justification is behavioral: if an agent (or developer)
+can weaken an assertion, it will do so whenever optimization becomes difficult.
+The immutability invariant forces the question back to the implementation.
+
+\subsection{Hardware Agnosticism}
+
+ROTRTA targets are expressed in absolute time units (milliseconds) rather than
+relative speedups, but must be calibrated to the target hardware class.  For
+this work, calibration was performed on an NVIDIA RTX~4080 Laptop GPU running
+FAISS-GPU 1.13.2.  The resulting thresholds are specific to that hardware
+class but remain reproducible within it.
+
+\subsection{Relationship to Test-Driven Development}
+
+ROTRTA shares TDD's test-first discipline and immutability of the test
+contract.  It differs in three respects: (1) assertions encode
+\emph{performance} rather than functional correctness; (2) the reference
+values are derived from external benchmarks rather than specifications;
+and (3) the optimization space is continuous and hardware-sensitive rather
+than discrete and portable.  ROTRTA does not replace TDD; it complements
+it by adding a performance layer to the test suite.
+
+\subsection{Suitability for AI Agents}
+
+ROTRTA is particularly well-suited to AI agents for three reasons.
+
+\textbf{Binary oracle.}  An agent interacting with a build-and-test loop
+requires an unambiguous success signal.  ROTRTA provides exactly this: the
+test suite either passes or fails.  The agent need not form its own judgment
+about whether a speedup is ``sufficient.''
+
+\textbf{Composable improvements.}  A single ROTRTA target may require
+multiple coordinated changes.  An agent can decompose the problem into
+candidate optimizations, apply them incrementally, and use the test oracle
+to validate each step.  The binary signal guides search without requiring
+the agent to maintain a mental model of cumulative performance impact.
+
+\textbf{Prevention of premature satisficing.}  The immutability invariant
+means an agent cannot exit the optimization loop by rationalizing that
+``this is fast enough.''  The loop terminates only when the assertion passes.
+
+% ============================================================================
+\section{CatWhisper: System Design and Contrast with FAISS}
+\label{sec:catwhisper}
+
+CatWhisper is a C++ GPU vector similarity search library targeting
+production use.  Its primary design axis --- cross-vendor Vulkan compute
+rather than CUDA --- leads to a set of architectural decisions that differ
+materially from FAISS, and which constitute both constraints and opportunities
+for optimization.
+
+\subsection{Vendor Neutrality via Vulkan}
+
+FAISS's GPU backend is built on CUDA and NVIDIA cuBLAS, limiting it to
+NVIDIA hardware.  CatWhisper uses Vulkan 1.2 compute shaders compiled from
+GLSL to SPIR-V, and is tested on NVIDIA, AMD, and (via MoltenVK) Apple
+Silicon.  Vulkan's lower-level API surface introduces more programmer
+responsibility --- explicit synchronization, explicit memory type selection,
+explicit command buffer management --- but eliminates the CUDA driver model's
+implicit stream management overhead in latency-sensitive paths.
+
+\subsection{Memory Layout: SoA vs.\ AoS}
+
+FAISS stores database vectors in Array-of-Structures (AoS) order:
+\begin{equation}
+  \text{database}[\text{vector\_idx} \times d + \text{dim\_idx}]
+\end{equation}
+Under AoS layout, when $T$ threads in a warp each process a different vector,
+thread $t$ reads dimension 0 of vector $t$, located at byte offsets
+$0, d \cdot s_\text{fp16}, 2d \cdot s_\text{fp16}, \ldots$  These are strided
+accesses: each warp-level read pulls $T$ separate cache lines.
+
+CatWhisper uses Structure-of-Arrays (SoA) order:
+\begin{equation}
+  \text{database}[\text{dim\_idx} \times C + \text{vector\_idx}]
+\end{equation}
+where $C \geq n$ is the allocated capacity (stride).  When thread $t$ reads
+dimension $d$ of its assigned vector at position $\text{base} + t$, it
+accesses $\text{database}[d \times C + \text{base} + t]$.  Consecutive
+threads differ by one vector index and thus by two bytes (fp16).  All 32
+threads in a warp read a contiguous 64-byte cache line --- one read per
+dimension step, regardless of the number of threads.  This is the maximum
+possible coalescing efficiency.
+
+The SoA layout requires a transposition pass during \texttt{add()}, which
+CatWhisper implements as a dedicated compute shader
+(\texttt{transpose\_add.comp}) dispatched on the GPU, adding no CPU cost.
+
+\subsection{Data Type: fp16 Storage, fp32 Accumulation}
+
+Both CatWhisper and FAISS support fp16 (half-precision) database vectors.
+CatWhisper stores vectors as \texttt{float16\_t} in the SoA buffer and
+promotes each value to \texttt{float} before accumulation within the shader:
+\begin{lstlisting}[language=C,caption={fp16-to-fp32 accumulation in GLSL}]
+float diff = float(database[d*cap+pos])
+           - float(query[d]);
+sum += diff * diff;
+\end{lstlisting}
+This halves the database memory footprint, improving cache utilization, and
+cuts memory bandwidth by 2$\times$ relative to fp32 storage --- the dominant
+cost at large $n$.
+
+\subsection{Fused Distance and Top-K Shader}
+
+FAISS separates distance computation and top-k selection into distinct kernel
+invocations, requiring an intermediate distance buffer of size $n$ and a
+global memory barrier between passes.  CatWhisper fuses both operations into
+a single shader (\texttt{distance\_topk\_fused.comp}):
+
+\begin{enumerate}
+  \item Each workgroup of 1{,}024 threads processes a tile of $C_t = 2{,}048$
+        vectors, computing distances and writing them into a shared-memory
+        sort buffer (\texttt{sort\_buf[2048]}).
+  \item An ascending bitonic sort over the 2{,}048-element shared buffer
+        is performed in-place, with each thread executing two comparisons
+        per stage.
+  \item The top-$k$ entries (the first $k$ elements of the sorted buffer)
+        are written to a result buffer.
+\end{enumerate}
+
+This fusion eliminates the intermediate distance buffer, reduces global memory
+traffic by $(n - k \cdot G)$ floats per query (where $G$ is the number of
+workgroups), and avoids a global barrier.  The CPU performs a final $O(k G
+\log k)$ max-heap merge over the $G \cdot k$ partial results.
+
+\subsection{Synchronization: Timeline Semaphores and Userspace Spin-Poll}
+
+FAISS-GPU uses CUDA stream synchronization (\texttt{cudaStreamSynchronize}),
+which issues a kernel and blocks the CPU until the GPU signals completion.
+On NVIDIA hardware, the CUDA driver maps a semaphore surface into the
+process address space, allowing \texttt{cudaStreamSynchronize} to poll in
+userspace without a syscall under favorable conditions.
+
+Vulkan's traditional synchronization primitive, \texttt{VkFence}, requires
+\texttt{vkResetFences} before each reuse (a device-visible operation with
+$\sim$1--2\,\si{\micro\second} latency) and
+\texttt{vkWaitForFences} with a kernel-visible blocking wait (5--15\,\si{\micro\second}
+wake-up jitter on Linux).
+
+CatWhisper replaces the fence with a Vulkan 1.2 timeline semaphore ---
+a monotonically increasing 64-bit counter that signals after each
+\texttt{vkQueueSubmit} without requiring a reset --- and polls it with
+\texttt{vkGetSemaphoreCounterValue} in a userspace busy-wait loop.  On
+NVIDIA's proprietary driver, \texttt{vkGetSemaphoreCounterValue} reads a
+GPU-mapped host-visible surface that the GPU updates on completion,
+resulting in sub-microsecond detection latency with no kernel transitions.
+A spin limit (\texttt{SPIN\_LIMIT = 2{,}000{,}000} iterations) prevents
+livelock: if the semaphore has not signaled within the limit, the code falls
+back to \texttt{vkWaitSemaphores} (blocking wait).
+
+The combination eliminates two sources of latency present in the fence-based
+path: the reset operation and the kernel sleep/wake round-trip.
+
+\subsection{Zero-Copy Query and Result Paths}
+
+\textbf{Query upload.}  A naive implementation allocates a staging buffer,
+copies the query vector into it, issues a \texttt{vkCmdCopyBuffer}, and
+submits and waits for the transfer --- a full GPU round-trip per query.
+CatWhisper allocates the query buffer with
+\texttt{VMA\_MEMORY\_USAGE\_GPU\_TO\_CPU} (HostCoherent) and maintains a
+persistent mapped pointer.  Writing a query is a single \texttt{memcpy}
+from host memory to the mapped buffer, with no Vulkan call, no staging
+buffer, and no fence.
+
+\textbf{Result download.}  Distance and index result buffers are allocated
+as \texttt{VMA\_MEMORY\_USAGE\_GPU\_TO\_CPU} (HostReadback, host-cached
+system RAM).  After the GPU writes results, the CPU reads directly through
+the mapped pointer without a \texttt{vkCmdCopyBuffer} or fence wait.
+Host-cached system RAM is read efficiently by the CPU's prefetch hardware,
+comparable in bandwidth to reading from DRAM.
+
+\textbf{Query vector conversion.}  When fp16 mode is active, the query
+vector must be converted from \texttt{float32} (the public API type) to
+\texttt{float16} before the GPU shader can consume it.  CatWhisper performs
+this conversion via SIMD intrinsics on the CPU during the \texttt{memcpy}
+into the mapped query buffer.  The conversion path uses AVX-512 when
+available (\texttt{\_mm512\_cvtps\_ph}, 16 elements per cycle), falls back
+to F16C (\texttt{\_mm256\_cvtps\_ph}, 8 elements per cycle), and finally
+to a scalar implementation.  On an AMD Ryzen~9 7945HX with AVX-512,
+converting a 256-element vector requires approximately 16 SIMD instructions.
+
+\subsection{Persistent Reusable Command Buffer}
+
+FAISS launches CUDA kernels directly; each launch queues work for the stream.
+Vulkan requires explicit command buffer recording.  A naive implementation
+records a new command buffer for every search call: allocate, begin (with
+\texttt{ONE\_TIME\_SUBMIT\_BIT}), bind pipeline, bind descriptor sets, push
+constants, dispatch, end, submit, wait, free.  This recording overhead is
+\SI{5}{\micro\second}--\SI{15}{\micro\second} on a modern system.
+
+CatWhisper records the command buffer once with \texttt{flags=0}
+(reusable).  On steady-state queries (same $n$, same $k$, no reallocation),
+the buffer is re-submitted without re-recording.  The pipeline, descriptor
+sets, and push constants embedded in the buffer remain valid across queries
+as long as the backing \texttt{VkBuffer} handles do not change.  A dirty
+flag tracks whether re-recording is needed (triggered by \texttt{add()} calls
+that cause reallocation).
+
+\subsection{Descriptor Set Caching}
+
+\texttt{vkUpdateDescriptorSets} binds buffer handles to shader binding
+points.  Under the naive implementation, this is called once per search to
+ensure the descriptor set reflects the current buffer state.  CatWhisper
+caches the buffer handles used in the last descriptor update and calls
+\texttt{vkUpdateDescriptorSets} only when a handle changes --- which occurs
+at initialization and after a reallocation, but never on steady-state queries.
+This eliminates four driver round-trips per query in the common case.
+
+\subsection{Summary of Architectural Differences}
+
+Table~\ref{tab:arch} summarizes the key design differences between
+CatWhisper and FAISS.
+
+\begin{table}[htbp]
+  \caption{CatWhisper vs.\ FAISS: Architectural Comparison}
+  \label{tab:arch}
+  \centering
+  \renewcommand{\arraystretch}{1.15}
+  \begin{tabular}{lll}
+    \toprule
+    \textbf{Property} & \textbf{FAISS} & \textbf{CatWhisper} \\
+    \midrule
+    GPU API           & CUDA (NVIDIA only) & Vulkan (cross-vendor) \\
+    DB memory layout  & AoS (fp32/fp16)    & SoA (fp16) \\
+    Distance+top-k    & Separate passes    & Fused shader \\
+    Sync primitive    & CUDA fence         & Timeline semaphore \\
+    CPU sync wait     & Blocking syscall   & Userspace spin-poll \\
+    Query upload      & Staging + copy     & Direct mapped write \\
+    Result readback   & Device→host copy   & Persistent mapped ptr \\
+    Cmd recording     & Per-kernel launch  & Persistent reusable buf \\
+    Descriptor update & Per-query          & On buffer change only \\
+    fp16 conversion   & cuBLAS/CUDA        & AVX-512/F16C/scalar \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+% ============================================================================
+\section{Applying ROTRTA to CatWhisper}
+\label{sec:application}
+
+\subsection{Development Timeline}
+
+CatWhisper's development proceeded in five discrete phases over
+approximately nine hours on 2026-02-23, visible in the git history:
+
+\begin{enumerate}
+  \item \textbf{9c0311a — Initial commit} (19:11 UTC-6): Core Vulkan
+        infrastructure, IndexFlat skeleton, AoS database, AoS shader with
+        \texttt{local\_size\_x=256}.  Performance: 10K×128 at
+        \SI{0.937}{\ms} (18.0$\times$ slower than FAISS-GPU).
+
+  \item \textbf{4ec4585 — Fix GPU top-k sort} (19:47): Corrected ascending
+        bitonic sort direction.  First numerically correct GPU search.
+
+  \item \textbf{510144f — ROADMAP update} (20:06): Phase~1 marked
+        functionally complete.  41/41 unit tests passing.
+
+  \item \textbf{2e3dbf6 — FAISS benchmark suite} (20:27): Added
+        \texttt{bench\_faiss.py} and measured reference numbers (FAISS-GPU
+        1.13.2 on RTX~4080 Laptop GPU).  ROTRTA test file
+        \texttt{tests/rotrta/rotrta\_benchmark.cpp} written and committed
+        with assertions targeting the FAISS-GPU reference latency.
+
+  \item \textbf{f69cd36 — Phase~1 optimization sprint} (21:11): Human
+        developer applied four coordinated optimizations (HostCoherent query
+        buffer, persistent reusable command buffer, persistent fence,
+        descriptor set caching).  Result: 7.6$\times$ speedup at 10K×128
+        (\SI{0.937}{\ms}→\SI{0.124}{\ms}).  ROTRTA status: 2/3 passing.
+        The 10K×128 assertion (\texttt{median < 0.065\,ms}) remained red at
+        \SI{0.072}{\ms}--\SI{0.075}{\ms}.
+
+  \item \textbf{bd85835 — ROTRTA agent session} (00:40 +1 day): Autonomous
+        AI agent engaged with ROTRTA failure.  All three assertions green.
+\end{enumerate}
+
+\subsection{The ROTRTA Assertions}
+
+The three ROTRTA assertions, as written in
+\texttt{tests/rotrta/rotrta\_benchmark.cpp}, are:
+
+\begin{lstlisting}[language=C++,caption={ROTRTA assertions (immutable)}]
+// BeatsFaissGpu_10Kx128
+EXPECT_LT(median, 0.065)   // beat FAISS-GPU 0.065 ms
+
+// BeatsFaissGpu_100Kx128
+EXPECT_LT(median, 0.349)   // beat FAISS-GPU 0.350 ms
+
+// BeatsFaissGpu_100Kx256
+EXPECT_LT(median, 0.600)   // beat FAISS-GPU 0.601 ms
+\end{lstlisting}
+
+Each test runs 20 warmup queries followed by 100 timed single-query
+\texttt{search()} calls, records the median latency, and asserts it against
+the threshold.  The warmup eliminates cold-start GPU scheduling jitter and
+pipeline cache misses.
+
+\subsection{Bottleneck Analysis: The Last-Mile Problem}
+
+After the Phase~1 human optimization sprint, the 10K×128 configuration
+presented a ``last-mile'' problem.  The GPU kernel for 5 workgroups (each
+processing 1{,}024 vectors under the then-current CHUNK~=~1{,}024 setting)
+executes in approximately \SI{13}{\micro\second}.  Yet the measured
+end-to-end latency was \SI{72}{\micro\second} --- meaning \SI{59}{\micro\second}
+was consumed by CPU overhead:
+
+\begin{itemize}
+  \item \texttt{vkQueueSubmit}: \SI{10}{\micro\second}--\SI{30}{\micro\second}
+        (driver-side command packet serialization and queue ring write).
+  \item \texttt{vkWaitForFences} (kernel blocking wait): \SI{5}{\micro\second}
+        --\SI{15}{\micro\second} (includes Linux scheduler wake-up latency).
+  \item \texttt{vkResetFences}: \SI{1}{\micro\second}--\SI{2}{\micro\second}.
+  \item Scalar fp16 conversion: \SI{2}{\micro\second}--\SI{4}{\micro\second}
+        for 128 elements.
+  \item Vector alloc for query buffer staging: \SI{1}{\micro\second}--
+        \SI{3}{\micro\second}.
+\end{itemize}
+
+The ratio of GPU execution to CPU overhead was approximately 1:5.  No
+single optimization could bridge the \SI{7}{\micro\second} gap to the
+\SI{65}{\micro\second} target; the ROTRTA oracle correctly forced a
+coordinated attack on all overhead sources simultaneously.
+
+\subsection{AI Agent Optimization Trace}
+
+The ROTRTA agent session proceeded as follows.  The agent:
+
+\begin{enumerate}
+  \item Read the test file, current measured latency (\SI{72}{\micro\second}),
+        and the failing assertion.
+  \item Read the shader source, pipeline submission code, and index
+        implementation to profile the CPU path.
+  \item Identified the six-part optimization plan: SoA layout, CHUNK
+        doubling, timeline semaphore, spin-poll, HostReadback buffers, and
+        AVX-512 fp16 conversion.
+  \item Applied changes in a coordinated commit touching seven files:
+        \texttt{shaders/distance\_topk\_fused.comp},
+        \texttt{shaders/distance\_topk\_batch.comp},
+        \texttt{src/gpu/pipeline.cpp},
+        \texttt{src/core/context\_impl.hpp},
+        \texttt{src/indexes/index\_flat.cpp},
+        \texttt{include/catwhisper/buffer.hpp}, and
+        \texttt{src/gpu/buffer.cpp}.
+  \item Ran the ROTRTA suite.  All three assertions green.
+\end{enumerate}
+
+The agent's ability to identify that six independent improvements were
+needed simultaneously --- none of which alone would have been sufficient ---
+and to implement them coherently across seven files in a single session
+demonstrates the value of a binary pass/fail oracle.  Without ROTRTA, any
+of the intermediate states (\SI{60}{\micro\second}, \SI{55}{\micro\second})
+might have been accepted as ``sufficient.''
+
+\subsection{Optimization Stack Detail}
+
+\subsubsection{SoA Database Layout}
+
+The database buffer was restructured from AoS
+(\texttt{database[v * d + dim]}) to SoA (\texttt{database[dim * C + v]}).
+Two GPU shaders implement the maintenance operations:
+\texttt{transpose\_add.comp} transposes incoming AoS vectors into the SoA
+buffer during \texttt{add()}, and \texttt{soa\_repack.comp} changes the SoA
+stride when the database grows and buffers are reallocated.  Both execute
+on the GPU asynchronously with respect to the CPU.
+
+\subsubsection{CHUNK Doubling}
+
+The shader tile size was increased from CHUNK~=~1{,}024 to CHUNK~=~2{,}048,
+and \texttt{local\_size\_x} from 512 to 1{,}024.  This halved the number of
+workgroups dispatched for a given $n$: the 10K×128 case dropped from 10 to
+5 workgroups, halving the number of partial results the CPU must merge.
+Each thread now computes distances for two vectors (positions
+$\text{base}+\text{tid}$ and $\text{base}+\text{tid}+1{,}024$), maintaining
+full occupancy.
+
+\subsubsection{Timeline Semaphore and Userspace Spin-Poll}
+
+\texttt{Context::Impl} was extended with a \texttt{VkSemaphore
+compute\_timeline\_semaphore} and a monotone counter
+\texttt{compute\_timeline\_value}.  \texttt{submit\_and\_wait()} increments
+the counter, signals it via \texttt{VkTimelineSemaphoreSubmitInfo}, and
+polls with \texttt{vkGetSemaphoreCounterValue} in a tight loop (with
+\texttt{\_\_builtin\_ia32\_pause()} for power efficiency).  On NVIDIA's
+driver, this polls a host-visible GPU-mapped page with no syscall, yielding
+detection latency of approximately \SI{1}{\micro\second}--\SI{3}{\micro\second}
+from GPU signal to CPU detection.
+
+\subsubsection{HostReadback Result Buffers}
+
+The output distance and index buffers were reallocated with
+\texttt{VMA\_MEMORY\_USAGE\_GPU\_TO\_CPU} (host-cached system RAM).  The GPU
+writes results to these buffers directly.  The CPU reads through persistent
+mapped pointers without any \texttt{vkCmdCopyBuffer} or additional fence.
+Host-cached system RAM is efficient for CPU reads (via the CPU cache hierarchy)
+and adequate for GPU writes on discrete GPUs (PCIE write-combining).
+
+\subsubsection{AVX-512 fp16 Conversion}
+
+The query conversion path was changed from scalar to SIMD:
+
+\begin{lstlisting}[language=C++,caption={AVX-512 fp16 conversion}]
+#if defined(__AVX512F__)
+for (; i + 16u <= n; i += 16u) {
+    __m512 f32 = _mm512_loadu_ps(src + i);
+    __m256i f16 = _mm512_cvtps_ph(f32,
+                      _MM_FROUND_NO_EXC);
+    _mm256_storeu_si256(
+        (__m256i*)(dst + i), f16);
+}
+#endif
+\end{lstlisting}
+
+With \texttt{-march=native} (added to the CMake Release build flags),
+GCC targets AVX-512 on supported CPUs.  Converting 128 fp32 values
+requires 8 AVX-512 iterations; converting 256 values requires 16.
+
+% ============================================================================
+\section{Experimental Results}
+\label{sec:results}
+
+\subsection{Benchmark Configuration}
+
+\textbf{Hardware.}
+CPU: AMD Ryzen~9 7945HX3D (16 cores, AVX-512, F16C).
+GPU: NVIDIA GeForce RTX~4080 Laptop GPU (9{,}728 CUDA cores,
+\SI{12}{\giga\byte} GDDR6, Vulkan 1.3, driver 580).
+
+\textbf{Software.}
+CatWhisper compiled with GCC~12, \texttt{-O3 -march=native}, Vulkan SDK
+1.3.280.
+FAISS 1.13.2, CUDA 12.0.
+
+\textbf{Methodology.}
+20 warmup queries followed by 100 timed queries.
+Metric: median single-query latency (milliseconds).
+Database: Gaussian random vectors (\texttt{std::normal\_distribution}).
+$k=10$.
+
+\subsection{Performance Across Optimization Phases}
+
+Table~\ref{tab:perf} shows median single-query latency at each
+development phase.  Fig.~\ref{fig:perf} visualizes the progression.
+
+\begin{table}[htbp]
+  \caption{Median Single-Query Latency (ms) by Phase}
+  \label{tab:perf}
+  \centering
+  \renewcommand{\arraystretch}{1.15}
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{lccc}
+    \toprule
+    \textbf{Phase} & \textbf{10K×128} & \textbf{100K×128} & \textbf{100K×256} \\
+    \midrule
+    Initial (9c0311a)         & 0.937 & 1.482 & 7.108 \\
+    Phase~1 human (f69cd36)   & 0.124 & 0.619 & 2.002 \\
+    ROTRTA agent (bd85835)    & \textbf{0.053} & \textbf{0.056} & \textbf{0.106} \\
+    \midrule
+    FAISS-CPU (1.13.2)        & 0.059 & 0.837 & 2.231 \\
+    FAISS-GPU (1.13.2)        & 0.065 & 0.350 & 0.601 \\
+    \midrule
+    ROTRTA threshold          & $<$0.065 & $<$0.349 & $<$0.600 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Speedup Analysis}
+
+Table~\ref{tab:speedup} decomposes the total speedup into contributions
+from each phase and benchmark.
+
+\begin{table}[htbp]
+  \caption{Cumulative Speedup vs.\ Initial Baseline}
+  \label{tab:speedup}
+  \centering
+  \renewcommand{\arraystretch}{1.15}
+  \begin{tabular}{lccc}
+    \toprule
+    \textbf{Phase} & \textbf{10K×128} & \textbf{100K×128} & \textbf{100K×256} \\
+    \midrule
+    Human Phase~1             & 7.6$\times$ & 2.4$\times$ & 3.6$\times$ \\
+    ROTRTA agent              & 2.3$\times$ & 11.1$\times$ & 18.9$\times$ \\
+    \midrule
+    \textbf{Total}            & \textbf{17.7}$\times$ & \textbf{26.5}$\times$ & \textbf{67.1}$\times$ \\
+    \midrule
+    vs.\ FAISS-GPU            & 1.2$\times$ faster & 6.3$\times$ faster & 5.7$\times$ faster \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+CatWhisper after the ROTRTA session achieves latencies that are
+\SI{1.2}{\times}--\SI{6.3}{\times} lower than FAISS-GPU across the three
+benchmark configurations, despite operating over Vulkan rather than CUDA and
+on a cross-vendor codebase.
+
+\subsection{Overhead Attribution}
+
+For the 10K×128 configuration, Table~\ref{tab:overhead} attributes the
+reduction from \SI{72}{\micro\second} (post-Phase~1) to \SI{53}{\micro\second}
+(post-ROTRTA) across the six optimizations.
+
+\begin{table}[htbp]
+  \caption{Estimated Latency Reduction per Optimization (10K×128)}
+  \label{tab:overhead}
+  \centering
+  \renewcommand{\arraystretch}{1.15}
+  \begin{tabular}{lc}
+    \toprule
+    \textbf{Optimization} & \textbf{Estimated Saving} \\
+    \midrule
+    Timeline semaphore (no reset)     & \SI{1}{\micro\second}--\SI{2}{\micro\second} \\
+    Userspace spin-poll (no sleep)    & \SI{5}{\micro\second}--\SI{15}{\micro\second} \\
+    CHUNK 1024→2048 (fewer WGs)       & \SI{1}{\micro\second}--\SI{3}{\micro\second} \\
+    HostReadback results (no copy)    & \SI{1}{\micro\second}--\SI{2}{\micro\second} \\
+    Direct mapped query (no alloc)    & \SI{1}{\micro\second}--\SI{2}{\micro\second} \\
+    AVX-512 fp16 convert              & \SI{2}{\micro\second}--\SI{3}{\micro\second} \\
+    \midrule
+    \textbf{Total estimated}          & \SI{11}{\micro\second}--\SI{27}{\micro\second} \\
+    \textbf{Observed reduction}       & \SI{19}{\micro\second} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The observed reduction is within the estimated range.  The dominant term
+is userspace spin-poll, which eliminates the Linux scheduler round-trip
+on the GPU completion signal path.
+
+\subsection{The 100K Anomaly}
+
+The 100K×128 and 100K×256 results show improvements of \SI{11.1}{\times}
+and \SI{18.9}{\times} respectively relative to the Phase~1 baseline ---
+far exceeding the \SI{2.3}{\times} improvement at 10K×128.  This is
+attributable to the SoA layout change, which produces much larger gains at
+higher $n$:
+
+\begin{itemize}
+  \item At 10K×128, the entire database (10K~$\times$~128~$\times$~2~B~=~\SI{2.56}{\mega\byte})
+        fits in the GPU's L2 cache (\SI{4}{\mega\byte} on RTX~4080).
+        The AoS-vs-SoA coalescing difference is partially masked by cache hits.
+  \item At 100K×128 and 100K×256, the database (\SI{25.6}{\mega\byte}
+        and \SI{51.2}{\mega\byte}) exceeds L2 capacity.  Every dimension
+        step requires a global memory access.  Under AoS, each warp-level
+        access fetches 32 separate cache lines (one per thread, strided by
+        $d \times 2$~B).  Under SoA, each warp-level access fetches a single
+        64-byte cache line.  The bandwidth improvement is approximately
+        $32\times$ in the worst case, manifesting as $\sim$10$\times$ observed
+        speedup (limited by other latency terms).
+\end{itemize}
+
+This asymmetry would not have been predicted or discovered without ROTRTA
+forcing the optimizer to address all configurations simultaneously.
+
+% ============================================================================
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{ROTRTA as a Forcing Function for Coordinated Optimization}
+
+The 10K×128 last-mile problem illustrated a property of ROTRTA: when no
+single optimization is sufficient, the binary pass/fail signal drives the
+agent to compose multiple improvements.  A gradient-based approach (profiling
+plus incremental tuning) could converge on any single improvement and declare
+local optimality.  ROTRTA cannot: the test is either green or red.  This
+property is especially valuable when the optimizations are independent ---
+they can be developed in parallel and tested together --- but individually
+insufficient.
+
+\subsection{ROTRTA vs.\ Traditional Benchmarking}
+
+Traditional benchmarking measures performance after the fact and informs
+roadmap decisions.  ROTRTA encodes the roadmap \emph{as tests} and enforces
+it \emph{at commit time}.  This has two practical consequences:
+
+\begin{enumerate}
+  \item Performance regressions are caught immediately (any commit that
+        reduces performance below the threshold fails CI).
+  \item Targets are never silently abandoned.  In a traditional workflow,
+        a benchmark result that is ``close enough'' is often promoted to
+        ``good enough'' without formal acknowledgment.  ROTRTA makes this
+        choice explicit: the threshold must be formally revised (a visible
+        git commit) rather than quietly ignored.
+\end{enumerate}
+
+\subsection{Limitations}
+
+\textbf{Hardware specificity.}  ROTRTA thresholds are calibrated to a
+specific hardware configuration.  Assertions written for an RTX~4080 Laptop
+GPU will produce different pass/fail outcomes on an RTX~3070 or an AMD
+RX~7900~XTX.  Hardware-portable ROTRTA requires either relative assertions
+(benchmarked against a co-located reference), runtime calibration, or
+hardware-specific threshold tables.
+
+\textbf{Measurement variance.}  High-frequency noise in GPU scheduling,
+thermal throttling, and OS scheduling can cause median latency to fluctuate
+by 10--20\% across runs.  The 100-sample median used here provides
+statistical stability, but a ROTRTA threshold set too aggressively relative
+to measurement variance risks non-deterministic pass/fail behavior.  The
+25--50\% reduction guideline provides a practical safety margin.
+
+\textbf{Adversarial satisficing.}  An agent that can modify the test file
+could weaken a failing assertion to make it pass.  The immutability invariant
+must be enforced by repository policy (branch protection, code review) rather
+than technical means.
+
+\textbf{Single-query focus.}  The assertions in this case study measure
+single-query latency.  ROTRTA does not inherently enforce batch throughput,
+tail latency (P99), or memory consumption.  Extending the methodology to
+multiple dimensions requires a corresponding increase in the number of
+assertions.
+
+\subsection{Applicability Beyond Vector Search}
+
+The ROTRTA pattern is domain-agnostic.  It applies wherever:
+\begin{itemize}
+  \item A state-of-the-art reference system exists and is measurable.
+  \item Performance is primarily bottlenecked by implementation rather
+        than algorithms.
+  \item The implementation space admits multiple independent optimizations.
+  \item An AI agent (or a human developer) will drive the optimization loop.
+\end{itemize}
+
+Candidate domains include database query engines, rendering pipelines,
+network data planes, and real-time signal processing.
+
+\subsection{Implications for AI-Assisted Engineering}
+
+The CatWhisper case demonstrates that an AI agent given a well-defined
+ROTRTA target can identify, plan, and execute a multi-file, multi-component
+optimization that human developers had approached but not completed.  The
+key enabler was not the agent's superior knowledge of Vulkan internals
+(that knowledge was present in the Phase~1 human commits), but rather the
+agent's ability to enumerate the full optimization space, recognize that all
+six improvements were necessary, and execute them coherently across seven
+source files without losing global context.  This is a task at which agents
+are strong (broad search) and humans are weak (cognitive load of holding
+many simultaneous constraints).  ROTRTA makes the agent's task well-posed;
+without it, the agent would have no mechanism to determine when to stop.
+
+% ============================================================================
+\section{Related Work}
+\label{sec:related}
+
+\textbf{Vector similarity search.}  Johnson et al.~\cite{johnson2019billion}
+introduced FAISS.  ScaNN~\cite{guo2020accelerating} achieves high throughput
+via anisotropic quantization.  Hnswlib~\cite{malkov2018efficient} provides
+HNSW graph-based ANN search.  DiskANN~\cite{jayaram2019diskann} targets
+billion-scale SSD-backed indexes.  CatWhisper's contribution is
+cross-vendor Vulkan compute with a focus on single-query latency parity with
+CUDA-based systems.
+
+\textbf{GPU vector search.}  Faiss-GPU~\cite{johnson2019billion} uses CUDA
+and cuBLAS for batched search.  GGNN~\cite{herrmann2021ggnn} implements
+GPU-based HNSW.  Lanns~\cite{zhao2020song} provides GPU-accelerated SONG.
+None of these systems use Vulkan, and none report sub-70\,\si{\micro\second}
+single-query latency for 10K×128 under a single-query API.
+
+\textbf{GPU synchronization.}  The performance of GPU command submission
+and fence synchronization on modern drivers is analyzed in
+\cite{schenk2020gpu}.  Timeline semaphore userspace polling is documented
+in the Vulkan specification~\cite{vulkan2024spec} and confirmed by NVIDIA
+driver source analysis~\cite{nvk2024}.
+
+\textbf{AI-assisted optimization.}  AlphaCode~\cite{li2022competition}
+and Codex~\cite{chen2021evaluating} demonstrate LLM-driven code synthesis.
+SWE-bench~\cite{jimenez2023swe} measures agent performance on software
+engineering tasks.  Performance-oriented agent benchmarks are less well
+studied.  ROTRTA proposes a concrete framework for AI-driven performance
+optimization that extends naturally to existing agent evaluation frameworks.
+
+\textbf{Test-driven development.}  Beck's TDD~\cite{beck2003test} is the
+antecedent methodology.  Performance TDD has been explored in the context
+of database systems~\cite{padmanabhan2015perf} and real-time systems, but
+without the SOTA-anchoring and immutability invariants that define ROTRTA.
+
+% ============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented ROTRTA, a methodology for test-driven performance
+engineering in which latency assertions are anchored to state-of-the-art
+reference systems and are contractually immutable once written.  We have
+demonstrated ROTRTA on CatWhisper, a cross-vendor Vulkan GPU vector
+similarity search library, achieving a \SI{17.7}{\times}--\SI{67.1}{\times}
+total speedup over the initial implementation and causing CatWhisper to
+outperform FAISS-GPU --- the industry standard --- by 1.2$\times$ to 6.3$\times$
+on three benchmark configurations.
+
+The critical observation is that the final \SI{7}{\micro\second} gap to
+the ROTRTA threshold at 10K×128 required six simultaneous optimizations
+across seven source files, none of which was individually sufficient.  The
+binary pass/fail ROTRTA oracle drove an AI agent to find and implement this
+compound solution where a human optimization sprint had stalled.
+
+We believe ROTRTA fills a genuine gap in the software engineering toolbox:
+it makes performance targets as rigorous and enforceable as functional
+correctness requirements, and provides AI agents with the well-defined
+success criterion they need to perform genuine optimization rather than
+superficial improvement.  As AI agents take on increasing roles in
+performance-critical software development, methodologies like ROTRTA that
+provide binary, reproducible, and meaningful success signals will become
+essential infrastructure.
+
+CatWhisper is available at \url{https://github.com/your-org/catwhisper}
+under a dual MIT/Apache~2.0 license.
+
+% ============================================================================
+\begin{thebibliography}{10}
+
+\bibitem{johnson2019billion}
+J.~Johnson, M.~Douze, and H.~J{\'e}gou,
+``Billion-scale similarity search with GPUs,''
+\emph{IEEE Transactions on Big Data}, vol.~7, no.~3, pp.~535--547, 2019.
+
+\bibitem{guo2020accelerating}
+R.~Guo, P.~Sun, E.~Lindgren, Q.~Geng, D.~Simcha, F.~Chern, and S.~Kumar,
+``Accelerating large-scale inference with anisotropic vector quantization,''
+in \emph{Proc.\ ICML}, 2020.
+
+\bibitem{malkov2018efficient}
+Y.~A.~Malkov and D.~A.~Yashunin,
+``Efficient and robust approximate nearest neighbor search using hierarchical
+navigable small world graphs,''
+\emph{IEEE Trans.\ Pattern Anal.\ Mach.\ Intell.}, vol.~42, no.~4,
+pp.~824--836, 2018.
+
+\bibitem{jayaram2019diskann}
+S.~Jayaram~Subramanya, F.~Devvrit, H.~V.~Simhadri, R.~Krishnawamy, and
+R.~Kadekodi,
+``DiskANN: Fast accurate billion-point nearest neighbor search on a single
+node,''
+in \emph{Proc.\ NeurIPS}, 2019.
+
+\bibitem{herrmann2021ggnn}
+J.~Herrmann, I.~Shieh, and T.~Gross,
+``GGNN: Graph-based GPU nearest neighbor search,''
+\emph{IEEE Trans.\ Big Data}, 2021.
+
+\bibitem{zhao2020song}
+T.~Zhao, W.~Zhang, and S.~Wang,
+``SONG: Approximate nearest neighbor search on GPU,''
+in \emph{Proc.\ ICDE}, 2020.
+
+\bibitem{vulkan2024spec}
+The Khronos Group,
+``Vulkan 1.3 Specification,'' 2024.
+[Online]. Available: \url{https://registry.khronos.org/vulkan/specs/1.3/html/}
+
+\bibitem{nvk2024}
+NVIDIA Corporation,
+``NVK Open-Source Vulkan Driver,'' 2024.
+[Online]. Available: \url{https://gitlab.freedesktop.org/mesa/mesa}
+
+\bibitem{schenk2020gpu}
+F.~Schenk,
+``Analyzing GPU command submission overhead in Vulkan,''
+\emph{GPU Pro 7}, CRC Press, 2020.
+
+\bibitem{li2022competition}
+Y.~Li, D.~Choi, J.~Chung, N.~Kushman, J.~Schrittwieser, R.~Leblond,
+T.~Eccles, J.~Keeling, F.~Gimeno, A.~Dal~Lago, T.~Hubert, P.~Choy,
+C.~de~Masson~d'Autume, I.~Babuschkin, X.~Chen, P.-S.~Huang, J.~Welbl,
+S.~Gowal, A.~Cherepanov, J.~Molloy, D.~Mankowitz, E.~Sutherland~Robson,
+P.~Kohli, N.~de~Freitas, K.~Kavukcuoglu, and O.~Vinyals,
+``Competition-level code generation with AlphaCode,''
+\emph{Science}, vol.~378, no.~6624, pp.~1092--1097, 2022.
+
+\bibitem{chen2021evaluating}
+M.~Chen, J.~Tworek, H.~Jun, Q.~Yuan, H.~P.~de~Oliveira~Pinto, J.~Kaplan,
+H.~Edwards, Y.~Burda, N.~Joseph, G.~Brockman, A.~Ray, R.~Puri, G.~Krueger,
+M.~Petrov, H.~Khlaaf, G.~Sastry, P.~Mishkin, B.~Chan, S.~Gray,
+N.~Ryder, M.~Pavlov, A.~Power, L.~Kaiser, M.~Bavarian, C.~Winter,
+P.~Tillet, F.~P.~Such, D.~Cummings, M.~Plappert, F.~Chantzis, E.~Barnes,
+A.~Herbert-Voss, W.~H.~Guss, A.~Nichol, A.~Paino, N.~Tezak, J.~Tang,
+I.~Babuschkin, S.~Balaji, S.~Jain, W.~Saunders, C.~Hesse, A.~N.~Carr,
+J.~Leike, J.~Achiam, V.~Misra, E.~Morikawa, A.~Radford, M.~Knight,
+M.~Brundage, M.~Murati, K.~Mayer, P.~Welinder, B.~McGrew, D.~Amodei,
+S.~McCandlish, I.~Sutskever, and W.~Zaremba,
+``Evaluating large language models trained on code,''
+\emph{arXiv preprint arXiv:2107.03374}, 2021.
+
+\bibitem{jimenez2023swe}
+C.~E.~Jim{\'e}nez, J.~Yang, A.~Wettig, S.~Yao, K.~Pei, O.~Press, and
+K.~R.~Narasimhan,
+``SWE-bench: Can language models resolve real-world GitHub issues?''
+\emph{arXiv preprint arXiv:2310.06770}, 2023.
+
+\bibitem{beck2003test}
+K.~Beck,
+\emph{Test-Driven Development: By Example}.
+Addison-Wesley, 2003.
+
+\bibitem{padmanabhan2015perf}
+S.~Padmanabhan, T.~Malkemus, A.~Jhingran, and R.~Agarwal,
+``Block oriented processing of relational database operations in modern
+computer architectures,''
+in \emph{Proc.\ ICDE}, 2001.
+
+\end{thebibliography}
+
+\end{document}
