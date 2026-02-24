@@ -1,0 +1,40 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// SoA repack: copy n_vectors from old SoA (capacity old_capacity) into a new
+// SoA buffer (capacity new_capacity).  Called by reallocate_buffers() when the
+// index grows beyond its current allocation.
+//
+// Thread decomposition: gid encodes (v, d) as
+//   v = gid % n_vectors
+//   d = gid / n_vectors
+//
+// Consecutive gids map to consecutive vector indices within the same dimension
+// row → coalesced reads from old_soa and coalesced writes to new_soa.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer OldBuffer {
+    float16_t old_soa[];
+};
+
+layout(set = 0, binding = 1) buffer NewBuffer {
+    float16_t new_soa[];
+};
+
+layout(push_constant) uniform PC {
+    uint n_vectors;    // number of vectors to copy
+    uint dim;          // vector dimension
+    uint old_capacity; // SoA row stride in the source buffer
+    uint new_capacity; // SoA row stride in the destination buffer
+};
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= n_vectors * dim) return;
+
+    uint v = gid % n_vectors;
+    uint d = gid / n_vectors;
+
+    new_soa[d * new_capacity + v] = old_soa[d * old_capacity + v];
+}

@@ -21,7 +21,9 @@ struct Context::Impl {
     VkDevice device = VK_NULL_HANDLE;
     VkQueue compute_queue = VK_NULL_HANDLE;
     VkCommandPool command_pool = VK_NULL_HANDLE;
-    VkFence       compute_fence = VK_NULL_HANDLE;  // persistent; reset before each submit
+    VkFence       compute_fence = VK_NULL_HANDLE;  // kept for legacy; unused in hot path
+    VkSemaphore   compute_timeline_semaphore = VK_NULL_HANDLE;  // timeline; never needs reset
+    uint64_t      compute_timeline_value = 0;
     VmaAllocator allocator = VK_NULL_HANDLE;
     
     uint32_t compute_queue_family = 0;
@@ -90,6 +92,10 @@ struct Context::Impl {
         if (allocator) {
             vmaDestroyAllocator(allocator);
             allocator = VK_NULL_HANDLE;
+        }
+        if (compute_timeline_semaphore) {
+            vkDestroySemaphore(device, compute_timeline_semaphore, nullptr);
+            compute_timeline_semaphore = VK_NULL_HANDLE;
         }
         if (compute_fence) {
             vkDestroyFence(device, compute_fence, nullptr);
@@ -216,31 +222,41 @@ private:
     
     Expected<void> create_device(const ContextOptions& options) {
         (void)options;  // Suppress unused warning
-        
+
         compute_queue_family = find_compute_queue_family();
-        
+
         float queue_priority = 1.0f;
         VkDeviceQueueCreateInfo queue_info = {};
         queue_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
         queue_info.queueFamilyIndex = compute_queue_family;
         queue_info.queueCount = 1;
         queue_info.pQueuePriorities = &queue_priority;
-        
-        VkPhysicalDeviceFeatures features = {};
-        features.shaderFloat64 = VK_TRUE;
-        features.shaderInt16 = VK_TRUE;
-        
+
+        // Vulkan 1.2 features: timeline semaphores (zero-reset submit) + fp16 arithmetic
+        VkPhysicalDeviceVulkan12Features vk12_features = {};
+        vk12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+        vk12_features.timelineSemaphore = VK_TRUE;
+        vk12_features.shaderFloat16    = VK_TRUE;
+
+        // Wrap 1.0 features in VkPhysicalDeviceFeatures2 to allow pNext chaining
+        VkPhysicalDeviceFeatures2 features2 = {};
+        features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        features2.pNext = &vk12_features;
+        features2.features.shaderFloat64 = VK_TRUE;
+        features2.features.shaderInt16   = VK_TRUE;
+
         VkDeviceCreateInfo device_info_create = {};
         device_info_create.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        device_info_create.pNext = &features2;       // timeline semaphore + fp16 via pNext chain
         device_info_create.queueCreateInfoCount = 1;
         device_info_create.pQueueCreateInfos = &queue_info;
-        device_info_create.pEnabledFeatures = &features;
-        
+        device_info_create.pEnabledFeatures = nullptr; // must be NULL when using Features2
+
         if (vkCreateDevice(physical_device, &device_info_create, nullptr, &device) != VK_SUCCESS) {
             return make_unexpected(ErrorCode::DeviceCreationFailed,
                                    "Failed to create Vulkan device");
         }
-        
+
         vkGetDeviceQueue(device, compute_queue_family, 0, &compute_queue);
         return {};
     }
@@ -260,6 +276,22 @@ private:
         if (vkCreateFence(device, &fence_info, nullptr, &compute_fence) != VK_SUCCESS) {
             return make_unexpected(ErrorCode::OperationFailed,
                                    "Failed to create compute fence");
+        }
+
+        // Timeline semaphore: monotonically increasing counter, never needs vkResetFences.
+        // Saves ~1-2μs per submit by eliminating the reset syscall.
+        VkSemaphoreTypeCreateInfo timeline_type_info = {};
+        timeline_type_info.sType         = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+        timeline_type_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        timeline_type_info.initialValue  = 0;
+
+        VkSemaphoreCreateInfo sem_info = {};
+        sem_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        sem_info.pNext = &timeline_type_info;
+
+        if (vkCreateSemaphore(device, &sem_info, nullptr, &compute_timeline_semaphore) != VK_SUCCESS) {
+            return make_unexpected(ErrorCode::OperationFailed,
+                                   "Failed to create timeline semaphore");
         }
 
         return {};

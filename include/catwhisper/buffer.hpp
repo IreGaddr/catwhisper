@@ -38,7 +38,8 @@ enum class MemoryType {
     DeviceLocal,
     HostVisible,
     HostCoherent,
-    DeviceOnly
+    DeviceOnly,
+    HostReadback   // GPU writes, CPU reads — VMA_MEMORY_USAGE_GPU_TO_CPU (host-cached)
 };
 
 struct BufferDesc {

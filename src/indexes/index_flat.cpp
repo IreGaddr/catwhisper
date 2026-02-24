@@ -8,6 +8,16 @@
 #include <cstring>
 #include <cmath>
 
+// F16C / AVX-512 fast float32→float16 batch conversion.
+// With -march=native these intrinsics map to 1-2 instructions per 8-16 floats.
+#if defined(__AVX512F__)
+#  include <immintrin.h>
+#  define CW_HAVE_AVX512_F16C 1
+#elif defined(__F16C__)
+#  include <immintrin.h>
+#  define CW_HAVE_F16C 1
+#endif
+
 namespace cw {
 
 // Helper functions for float16 conversion
@@ -59,8 +69,43 @@ static float half_to_float(uint16_t h) {
     return f;
 }
 
+// Batch float32 → float16 conversion using F16C/AVX-512 when available,
+// falling back to the scalar float_to_half otherwise.
+// Destination must point into a persistently-mapped HostCoherent buffer;
+// no separate staging vector is allocated.
+static void convert_f32_to_f16_into(const float* __restrict__ src,
+                                     uint16_t*    __restrict__ dst,
+                                     uint32_t n) {
+    uint32_t i = 0;
+#if defined(CW_HAVE_AVX512_F16C)
+    // 16 floats → 16 fp16 per iteration
+    for (; i + 16u <= n; i += 16u) {
+        __m512  f32 = _mm512_loadu_ps(src + i);
+        __m256i f16 = _mm512_cvtps_ph(f32, _MM_FROUND_NO_EXC);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), f16);
+    }
+    // 8-wide tail
+    for (; i + 8u <= n; i += 8u) {
+        __m256  f32 = _mm256_loadu_ps(src + i);
+        __m128i f16 = _mm256_cvtps_ph(f32, _MM_FROUND_NO_EXC);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), f16);
+    }
+#elif defined(CW_HAVE_F16C)
+    // 8 floats → 8 fp16 per iteration
+    for (; i + 8u <= n; i += 8u) {
+        __m256  f32 = _mm256_loadu_ps(src + i);
+        __m128i f16 = _mm256_cvtps_ph(f32, _MM_FROUND_NO_EXC);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), f16);
+    }
+#endif
+    // scalar tail (or full loop when no SIMD)
+    for (; i < n; ++i) {
+        dst[i] = float_to_half(src[i]);
+    }
+}
+
 // TOPK_CHUNK must match the CHUNK constant in topk_heap.comp and distance_topk_fused.comp.
-static constexpr uint32_t TOPK_CHUNK = 512u;
+static constexpr uint32_t TOPK_CHUNK = 2048u;
 
 struct IndexFlat::Impl {
     Context* ctx = nullptr;
@@ -97,6 +142,13 @@ struct IndexFlat::Impl {
     Buffer result_distances_buffer;
     Buffer result_indices_buffer;
 
+    // SoA maintenance pipelines
+    Pipeline transpose_add_pipeline;   // AoS staging → SoA database on add()
+    DescriptorSet transpose_add_desc_set;
+    Pipeline soa_repack_pipeline;      // SoA old-cap → new-cap on reallocate
+    DescriptorSet soa_repack_desc_set;
+    Buffer staging_buffer;             // HostCoherent mapped; holds new fp16 AoS data
+
     // Persistent command buffer for search (reused across calls)
     CommandBuffer search_cmd;
     bool search_cmd_valid = false;
@@ -111,6 +163,12 @@ struct IndexFlat::Impl {
     VkBuffer fused_bound_query    = VK_NULL_HANDLE;
     VkBuffer fused_bound_rdist    = VK_NULL_HANDLE;
     VkBuffer fused_bound_ridx     = VK_NULL_HANDLE;
+
+    // merge_heap: pre-allocated heap for the k-way merge step.
+    // merge_dist_buf / merge_idx_buf removed: we now read directly from the
+    // persistently-mapped HostReadback result buffers, eliminating two memcpy
+    // calls (typically ~200 bytes each) on every query.
+    std::vector<std::pair<float, uint32_t>> merge_heap;
 
     std::vector<VectorId> id_mapping;
 };
@@ -221,7 +279,7 @@ Expected<void> IndexFlat::init_pipelines() {
         {2, DescriptorBinding::StorageBuffer},  // out_distances
         {3, DescriptorBinding::StorageBuffer},  // out_indices
     };
-    fused_l2_desc.push_constant_size = 16;  // n_vectors, dimension, k, metric
+    fused_l2_desc.push_constant_size = 20;  // n_vectors, dimension, k, metric, capacity
 
     auto fused_l2_result = Pipeline::create(*impl_->ctx, fused_l2_desc);
     if (!fused_l2_result) {
@@ -252,7 +310,7 @@ Expected<void> IndexFlat::init_pipelines() {
         {2, DescriptorBinding::StorageBuffer},  // out_distances
         {3, DescriptorBinding::StorageBuffer},  // out_indices
     };
-    batch_desc.push_constant_size = 20;  // n_vectors, dimension, k, n_queries, metric
+    batch_desc.push_constant_size = 24;  // n_vectors, dimension, k, n_queries, metric, capacity
 
     auto batch_result = Pipeline::create(*impl_->ctx, batch_desc);
     if (!batch_result) {
@@ -267,6 +325,53 @@ Expected<void> IndexFlat::init_pipelines() {
                                "Failed to create batch descriptor set");
     }
     impl_->batch_desc_set = std::move(*batch_desc_result);
+
+    // ---- SoA maintenance pipelines ----
+    // Transpose add: AoS staging -> SoA database
+    PipelineDesc transpose_add_desc;
+    transpose_add_desc.shader_name = "transpose_add";
+    transpose_add_desc.bindings = {
+        {0, DescriptorBinding::StorageBuffer},  // staging (AoS)
+        {1, DescriptorBinding::StorageBuffer},  // database (SoA)
+    };
+    transpose_add_desc.push_constant_size = 16;  // n_new, dim, n_existing, capacity
+
+    auto transpose_add_result = Pipeline::create(*impl_->ctx, transpose_add_desc);
+    if (!transpose_add_result) {
+        return make_unexpected(transpose_add_result.error().code(),
+                               "Failed to create transpose_add pipeline: " + transpose_add_result.error().message());
+    }
+    impl_->transpose_add_pipeline = std::move(*transpose_add_result);
+
+    auto transpose_add_desc_result = DescriptorSet::create(*impl_->ctx, impl_->transpose_add_pipeline);
+    if (!transpose_add_desc_result) {
+        return make_unexpected(transpose_add_desc_result.error().code(),
+                               "Failed to create transpose_add descriptor set");
+    }
+    impl_->transpose_add_desc_set = std::move(*transpose_add_desc_result);
+
+    // SoA repack: old capacity -> new capacity
+    PipelineDesc soa_repack_desc;
+    soa_repack_desc.shader_name = "soa_repack";
+    soa_repack_desc.bindings = {
+        {0, DescriptorBinding::StorageBuffer},  // old_soa
+        {1, DescriptorBinding::StorageBuffer},  // new_soa
+    };
+    soa_repack_desc.push_constant_size = 16;  // n_vectors, dim, old_capacity, new_capacity
+
+    auto soa_repack_result = Pipeline::create(*impl_->ctx, soa_repack_desc);
+    if (!soa_repack_result) {
+        return make_unexpected(soa_repack_result.error().code(),
+                               "Failed to create soa_repack pipeline: " + soa_repack_result.error().message());
+    }
+    impl_->soa_repack_pipeline = std::move(*soa_repack_result);
+
+    auto soa_repack_desc_result = DescriptorSet::create(*impl_->ctx, impl_->soa_repack_pipeline);
+    if (!soa_repack_desc_result) {
+        return make_unexpected(soa_repack_desc_result.error().code(),
+                               "Failed to create soa_repack descriptor set");
+    }
+    impl_->soa_repack_desc_set = std::move(*soa_repack_desc_result);
 
     return {};
 }
@@ -315,25 +420,83 @@ Expected<void> IndexFlat::add(std::span<const float> data, uint64_t n,
         impl_->capacity = new_capacity;
     }
     
+    // ---- Ensure staging buffer is large enough ----
+    uint64_t element_size = impl_->use_fp16 ? sizeof(uint16_t) : sizeof(float);
+    uint64_t staging_size = n * impl_->dimension * element_size;
+    
+    if (!impl_->staging_buffer.valid() || impl_->staging_buffer.size() < staging_size) {
+        BufferDesc staging_desc = {};
+        staging_desc.size = staging_size;
+        staging_desc.usage = BufferUsage::Storage | BufferUsage::TransferDst;
+        staging_desc.memory_type = MemoryType::HostCoherent;
+        staging_desc.map_on_create = true;
+        
+        auto sbuf = Buffer::create(*impl_->ctx, staging_desc);
+        if (!sbuf) {
+            return make_unexpected(sbuf.error().code(), "Failed to create staging buffer");
+        }
+        impl_->staging_buffer = std::move(*sbuf);
+    }
+    
+    // ---- Convert to fp16 and upload to staging (AoS layout) ----
+    std::vector<uint8_t> fp16_data;
     if (impl_->use_fp16) {
-        std::vector<uint8_t> fp16_data(n * impl_->dimension * sizeof(uint16_t));
+        fp16_data.resize(n * impl_->dimension * sizeof(uint16_t));
         uint16_t* fp16_ptr = reinterpret_cast<uint16_t*>(fp16_data.data());
         for (uint64_t i = 0; i < n * impl_->dimension; ++i) {
             fp16_ptr[i] = float_to_half(data[i]);
         }
-        auto upload_result = impl_->data_buffer.upload(fp16_data, 
-            impl_->n_vectors * impl_->dimension * sizeof(uint16_t));
-        if (!upload_result) {
-            return upload_result;
-        }
     } else {
-        std::vector<uint8_t> byte_data(n * impl_->dimension * sizeof(float));
-        std::memcpy(byte_data.data(), data.data(), byte_data.size());
-        auto upload_result = impl_->data_buffer.upload(byte_data,
-            impl_->n_vectors * impl_->dimension * sizeof(float));
-        if (!upload_result) {
-            return upload_result;
-        }
+        fp16_data.resize(n * impl_->dimension * sizeof(float));
+        std::memcpy(fp16_data.data(), data.data(), fp16_data.size());
+    }
+    
+    auto upload_result = impl_->staging_buffer.upload(fp16_data);
+    if (!upload_result) {
+        return upload_result;
+    }
+    
+    // ---- Dispatch transpose_add shader ----
+    auto bind_result = impl_->transpose_add_desc_set.bind_buffer(0, impl_->staging_buffer);
+    if (!bind_result) {
+        return make_unexpected(bind_result.error().code(), bind_result.error().message());
+    }
+    bind_result = impl_->transpose_add_desc_set.bind_buffer(1, impl_->data_buffer);
+    if (!bind_result) {
+        return make_unexpected(bind_result.error().code(), bind_result.error().message());
+    }
+    
+    auto cmd_result = CommandBuffer::create(*impl_->ctx);
+    if (!cmd_result) {
+        return make_unexpected(cmd_result.error().code(), cmd_result.error().message());
+    }
+    auto cmd = std::move(*cmd_result);
+    
+    struct TransposePushConstants {
+        uint32_t n_new;
+        uint32_t dim;
+        uint32_t n_existing;
+        uint32_t capacity;
+    } tpc = {
+        static_cast<uint32_t>(n),
+        impl_->dimension,
+        static_cast<uint32_t>(impl_->n_vectors),
+        static_cast<uint32_t>(impl_->capacity)
+    };
+    
+    cmd.begin();
+    cmd.bind_pipeline(impl_->transpose_add_pipeline);
+    cmd.bind_descriptor_set(impl_->transpose_add_pipeline, impl_->transpose_add_desc_set);
+    cmd.push_constants(impl_->transpose_add_pipeline, &tpc, sizeof(tpc));
+    
+    uint64_t total_elements = n * impl_->dimension;
+    uint32_t n_wg = static_cast<uint32_t>((total_elements + 255) / 256);
+    cmd.dispatch(n_wg);
+    cmd.end();
+    
+    auto submit_result = submit_and_wait(*impl_->ctx, cmd);
+    if (!submit_result) {
+        return submit_result;
     }
     
     if (ids.empty()) {
@@ -366,21 +529,50 @@ Expected<void> IndexFlat::reallocate_buffers(uint64_t new_capacity) {
     }
     
     if (impl_->data_buffer.valid() && impl_->n_vectors > 0) {
+        // ---- Use soa_repack shader for SoA -> SoA copy with stride change ----
+        auto bind_result = impl_->soa_repack_desc_set.bind_buffer(0, impl_->data_buffer);
+        if (!bind_result) {
+            return make_unexpected(bind_result.error().code(), bind_result.error().message());
+        }
+        bind_result = impl_->soa_repack_desc_set.bind_buffer(1, *new_data);
+        if (!bind_result) {
+            return make_unexpected(bind_result.error().code(), bind_result.error().message());
+        }
+        
         auto cmd_result = CommandBuffer::create(*impl_->ctx);
         if (!cmd_result) {
             return make_unexpected(cmd_result.error().code(), cmd_result.error().message());
         }
         auto cmd = std::move(*cmd_result);
         
+        struct RepackPushConstants {
+            uint32_t n_vectors;
+            uint32_t dim;
+            uint32_t old_capacity;
+            uint32_t new_capacity;
+        } rpc = {
+            static_cast<uint32_t>(impl_->n_vectors),
+            impl_->dimension,
+            static_cast<uint32_t>(impl_->capacity),
+            static_cast<uint32_t>(new_capacity)
+        };
+        
         cmd.begin();
-        cmd.copy_buffer(impl_->data_buffer, *new_data, 
-                       impl_->n_vectors * impl_->dimension * element_size);
+        cmd.bind_pipeline(impl_->soa_repack_pipeline);
+        cmd.bind_descriptor_set(impl_->soa_repack_pipeline, impl_->soa_repack_desc_set);
+        cmd.push_constants(impl_->soa_repack_pipeline, &rpc, sizeof(rpc));
+        
+        uint64_t total_elements = impl_->n_vectors * impl_->dimension;
+        uint32_t n_wg = static_cast<uint32_t>((total_elements + 255) / 256);
+        cmd.dispatch(n_wg);
         cmd.end();
         
         auto submit_result = submit_and_wait(*impl_->ctx, cmd);
         if (!submit_result) {
             return submit_result;
         }
+        
+        impl_->fused_bound_data = VK_NULL_HANDLE;  // force descriptor rebind
     }
     
     impl_->data_buffer = std::move(*new_data);
@@ -424,22 +616,18 @@ Expected<SearchResults> IndexFlat::search(Vector query, uint32_t k) {
         impl_->fused_bound_query = VK_NULL_HANDLE;  // force descriptor rebind
     }
     
-    // ---- Upload query ----
-    std::vector<uint8_t> query_bytes;
-    if (impl_->use_fp16) {
-        query_bytes.resize(impl_->dimension * sizeof(uint16_t));
-        uint16_t* fp16_query = reinterpret_cast<uint16_t*>(query_bytes.data());
-        for (uint32_t i = 0; i < impl_->dimension; ++i) {
-            fp16_query[i] = float_to_half(query[i]);
+    // ---- Write query directly into the persistently-mapped HostCoherent buffer ----
+    // Eliminates one heap allocation + one memcpy vs the old vector<uint8_t> approach.
+    // HostCoherent writes are immediately visible to the GPU without explicit flushing.
+    {
+        void* mapped_q = impl_->query_buffer.mapped();
+        if (impl_->use_fp16) {
+            convert_f32_to_f16_into(query.data(),
+                                    reinterpret_cast<uint16_t*>(mapped_q),
+                                    impl_->dimension);
+        } else {
+            std::memcpy(mapped_q, query.data(), impl_->dimension * sizeof(float));
         }
-    } else {
-        query_bytes.resize(impl_->dimension * sizeof(float));
-        std::memcpy(query_bytes.data(), query.data(), query_bytes.size());
-    }
-    
-    auto upload_result = impl_->query_buffer.upload(query_bytes);
-    if (!upload_result) {
-        return make_unexpected(upload_result.error().code(), "Failed to upload query");
     }
     
     // ---- Allocate partial-result buffers ----
@@ -449,10 +637,15 @@ Expected<SearchResults> IndexFlat::search(Vector query, uint32_t k) {
     if (!impl_->result_distances_buffer.valid() ||
         impl_->result_distances_buffer.size() < partial_size) {
 
+        // HostReadback (VMA_MEMORY_USAGE_GPU_TO_CPU): GPU writes → CPU reads.
+        // Host-cached system RAM: CPU reads are L1/L2 cached after the first access,
+        // much faster than write-combined BAR memory used by HostVisible/HostCoherent.
+        // We hold persistent maps and read directly from the pointers after the
+        // fence/semaphore signals, eliminating all intermediate download copies.
         BufferDesc res_desc = {};
         res_desc.size = partial_size;
         res_desc.usage = BufferUsage::Storage | BufferUsage::TransferSrc | BufferUsage::TransferDst;
-        res_desc.memory_type = MemoryType::HostVisible;
+        res_desc.memory_type = MemoryType::HostReadback;
         res_desc.map_on_create = true;
 
         auto rdbuf = Buffer::create(*impl_->ctx, res_desc);
@@ -549,11 +742,13 @@ Expected<SearchResults> IndexFlat::search(Vector query, uint32_t k) {
             uint32_t dimension;
             uint32_t k;
             uint32_t metric;  // 0 = L2, 1 = IP
+            uint32_t capacity;
         } fpc = {
             static_cast<uint32_t>(impl_->n_vectors),
             impl_->dimension,
             k,
-            (impl_->metric == Metric::IP) ? 1u : 0u
+            (impl_->metric == Metric::IP) ? 1u : 0u,
+            static_cast<uint32_t>(impl_->capacity)
         };
         impl_->search_cmd.push_constants(fused_pipeline, &fpc, sizeof(fpc));
         impl_->search_cmd.dispatch(n_topk_wg);
@@ -575,45 +770,44 @@ Expected<SearchResults> IndexFlat::search(Vector query, uint32_t k) {
     }
 
     // ---- CPU merge: find global top-k from n_topk_wg * k candidates ----
+    // Read directly from the persistently-mapped HostReadback buffers — no download
+    // memcpy, no intermediate staging.  After vkWaitSemaphores the GPU writes are
+    // fully visible to the host.
     uint32_t n_partial = n_topk_wg * k;
-    std::vector<uint8_t> dist_bytes(static_cast<uint64_t>(n_partial) * sizeof(float));
-    std::vector<uint8_t> idx_bytes(static_cast<uint64_t>(n_partial) * sizeof(uint32_t));
+    const float*    mapped_dists = reinterpret_cast<const float*>(
+                                       impl_->result_distances_buffer.mapped());
+    const uint32_t* mapped_idxs  = reinterpret_cast<const uint32_t*>(
+                                       impl_->result_indices_buffer.mapped());
 
-    auto download_dist = impl_->result_distances_buffer.download(dist_bytes);
-    if (!download_dist) {
-        return make_unexpected(download_dist.error().code(), download_dist.error().message());
-    }
-    auto download_idx = impl_->result_indices_buffer.download(idx_bytes);
-    if (!download_idx) {
-        return make_unexpected(download_idx.error().code(), download_idx.error().message());
-    }
+    // Max-heap merge: O(n log k).  Heap is max-heap with largest (worst) dist at top.
+    impl_->merge_heap.clear();
+    impl_->merge_heap.reserve(k + 1);
 
-    const float*    raw_dists = reinterpret_cast<const float*>(dist_bytes.data());
-    const uint32_t* raw_idxs  = reinterpret_cast<const uint32_t*>(idx_bytes.data());
+    auto heap_push = [&](float dist, uint32_t idx) {
+        if (impl_->merge_heap.size() < k) {
+            impl_->merge_heap.emplace_back(dist, idx);
+            std::push_heap(impl_->merge_heap.begin(), impl_->merge_heap.end());
+        } else if (dist < impl_->merge_heap[0].first) {
+            std::pop_heap(impl_->merge_heap.begin(), impl_->merge_heap.end());
+            impl_->merge_heap.back() = {dist, idx};
+            std::push_heap(impl_->merge_heap.begin(), impl_->merge_heap.end());
+        }
+    };
 
-    // Collect valid (distance, vector_index) pairs, discarding +inf sentinels.
-    std::vector<std::pair<float, uint32_t>> candidates;
-    candidates.reserve(n_partial);
+    const uint32_t n_vectors_u32 = static_cast<uint32_t>(impl_->n_vectors);
     for (uint32_t i = 0; i < n_partial; ++i) {
-        if (raw_idxs[i] != 0xFFFFFFFFu && raw_idxs[i] < static_cast<uint32_t>(impl_->n_vectors)) {
-            candidates.emplace_back(raw_dists[i], raw_idxs[i]);
+        uint32_t idx = mapped_idxs[i];
+        if (idx != 0xFFFFFFFFu && idx < n_vectors_u32) {
+            heap_push(mapped_dists[i], idx);
         }
     }
 
-    uint32_t actual_k = std::min(k, static_cast<uint32_t>(candidates.size()));
-    if (actual_k > 0) {
-        std::partial_sort(
-            candidates.begin(),
-            candidates.begin() + actual_k,
-            candidates.end(),
-            [](const std::pair<float,uint32_t>& a, const std::pair<float,uint32_t>& b) {
-                return a.first < b.first;
-            });
-
-        for (uint32_t i = 0; i < actual_k; ++i) {
-            results.results[i].distance = candidates[i].first;
-            results.results[i].id       = impl_->id_mapping[candidates[i].second];
-        }
+    // sort_heap yields ascending order (smallest dist first)
+    std::sort_heap(impl_->merge_heap.begin(), impl_->merge_heap.end());
+    uint32_t actual_k = std::min(k, static_cast<uint32_t>(impl_->merge_heap.size()));
+    for (uint32_t i = 0; i < actual_k; ++i) {
+        results.results[i].distance = impl_->merge_heap[i].first;
+        results.results[i].id       = impl_->id_mapping[impl_->merge_heap[i].second];
     }
 
     return results;
@@ -713,12 +907,14 @@ Expected<SearchResults> IndexFlat::search(std::span<const float> queries,
         uint32_t k;
         uint32_t n_queries;
         uint32_t metric;
+        uint32_t capacity;
     } bpc = {
         static_cast<uint32_t>(impl_->n_vectors),
         impl_->dimension,
         k,
         static_cast<uint32_t>(n_queries),
-        (impl_->metric == Metric::IP) ? 1u : 0u
+        (impl_->metric == Metric::IP) ? 1u : 0u,
+        static_cast<uint32_t>(impl_->capacity)
     };
     cmd.push_constants(impl_->batch_pipeline, &bpc, sizeof(bpc));
     cmd.dispatch(n_wg_x, static_cast<uint32_t>(n_queries), 1);

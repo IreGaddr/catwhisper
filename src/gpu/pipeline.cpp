@@ -152,8 +152,10 @@ Expected<void> Pipeline::load_shader(Context& ctx, const std::string& name,
     // Try multiple paths
     std::vector<std::string> search_paths = {
         path,
+        "build_release/shaders/" + name + ".comp.spv",
         "build/shaders/" + name + ".comp.spv",
         "../shaders/" + name + ".comp.spv",
+        "../build_release/shaders/" + name + ".comp.spv",
         "../build/shaders/" + name + ".comp.spv"
     };
     
@@ -418,24 +420,58 @@ void* CommandBuffer::vulkan_command_buffer() const {
 }
 
 Expected<void> submit_and_wait(Context& ctx, CommandBuffer& cmd) {
-    // Reuse the persistent per-context fence instead of allocating a new one
-    // on every call.  The fence starts unsignaled (created with no flags), so we
-    // reset it before each use.  Submissions are always serialised through this
-    // function (every caller blocks until completion), so there is no aliasing.
-    VkFence fence = ctx.impl_->compute_fence;
-    vkResetFences(ctx.impl_->device, 1, &fence);
+    // Use the persistent timeline semaphore — no vkResetFences needed.
+    uint64_t signal_value = ++ctx.impl_->compute_timeline_value;
 
-    VkSubmitInfo submit_info = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &cmd.impl_->cmd
-    };
+    VkTimelineSemaphoreSubmitInfo timeline_submit = {};
+    timeline_submit.sType                    = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+    timeline_submit.signalSemaphoreValueCount = 1;
+    timeline_submit.pSignalSemaphoreValues   = &signal_value;
 
-    if (vkQueueSubmit(ctx.impl_->compute_queue, 1, &submit_info, fence) != VK_SUCCESS) {
+    VkSubmitInfo submit_info = {};
+    submit_info.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.pNext                = &timeline_submit;
+    submit_info.commandBufferCount   = 1;
+    submit_info.pCommandBuffers      = &cmd.impl_->cmd;
+    submit_info.signalSemaphoreCount = 1;
+    submit_info.pSignalSemaphores    = &ctx.impl_->compute_timeline_semaphore;
+
+    if (vkQueueSubmit(ctx.impl_->compute_queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) {
         return make_unexpected(ErrorCode::OperationFailed, "Failed to submit queue");
     }
 
-    vkWaitForFences(ctx.impl_->device, 1, &fence, VK_TRUE, UINT64_MAX);
+    // Userspace spin-poll on the timeline semaphore counter.
+    // On NVIDIA's proprietary driver vkGetSemaphoreCounterValue reads from a
+    // GPU-mapped surface in process address space — no kernel transition needed.
+    // This eliminates the ~5-15 μs kernel sleep/wake-up latency that
+    // vkWaitSemaphores incurs for short-running GPU workloads.
+    //
+    // SPIN_LIMIT caps the busy-wait so that for very long GPU workloads we fall
+    // back to the blocking path and don't pin a CPU core forever.
+    static constexpr uint32_t SPIN_LIMIT = 2000000u;
+    uint64_t current = 0;
+    for (uint32_t spin = 0; spin < SPIN_LIMIT; ++spin) {
+        if (spin > 0) {
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();  // PAUSE hint: reduces power and improves SMT throughput
+#endif
+        }
+        if (vkGetSemaphoreCounterValue(ctx.impl_->device,
+                                       ctx.impl_->compute_timeline_semaphore,
+                                       &current) == VK_SUCCESS
+            && current >= signal_value) {
+            return {};
+        }
+    }
+
+    // Fallback: blocking wait (should only trigger for very long GPU workloads)
+    VkSemaphoreWaitInfo wait_info = {};
+    wait_info.sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    wait_info.semaphoreCount = 1;
+    wait_info.pSemaphores    = &ctx.impl_->compute_timeline_semaphore;
+    wait_info.pValues        = &signal_value;
+
+    vkWaitSemaphores(ctx.impl_->device, &wait_info, UINT64_MAX);
     return {};
 }
 

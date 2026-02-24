@@ -1,0 +1,50 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// AoS → SoA transpose for IndexFlat::add().
+//
+// Reads new vectors from a host-visible staging buffer in row-major (AoS)
+// layout and writes them into the SoA database buffer at the correct offsets.
+//
+// SoA layout:  database[dimension_idx * capacity + vector_idx]
+//
+// Thread decomposition: gid encodes (v, d) as
+//   v = gid % n_new   (vector index within new batch)
+//   d = gid / n_new   (dimension index)
+//
+// This keeps consecutive gids writing consecutive database positions within
+// each dimension row → coalesced writes to the DeviceLocal database buffer.
+
+layout(local_size_x = 256) in;
+
+// Binding 0: AoS staging buffer — n_new vectors × dimension fp16 values.
+layout(set = 0, binding = 0) readonly buffer StagingBuffer {
+    float16_t staging[];
+};
+
+// Binding 1: SoA database buffer — dimension × capacity fp16 values.
+layout(set = 0, binding = 1) buffer DatabaseBuffer {
+    float16_t database[];
+};
+
+layout(push_constant) uniform PC {
+    uint n_new;       // number of vectors being added this call
+    uint dim;         // vector dimension
+    uint n_existing;  // vectors already present in the database
+    uint capacity;    // database buffer capacity (SoA row stride, >= n_existing + n_new)
+};
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= n_new * dim) return;
+
+    uint v = gid % n_new;   // index within this new batch
+    uint d = gid / n_new;   // dimension
+
+    // AoS read  (staging is CPU-written, once per add() call — non-coalesced ok)
+    float16_t val = staging[v * dim + d];
+
+    // SoA write — coalesced: consecutive gids have consecutive v → consecutive
+    // addresses within a dimension row.
+    database[d * capacity + (n_existing + v)] = val;
+}

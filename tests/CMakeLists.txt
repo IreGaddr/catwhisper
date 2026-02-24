@@ -23,3 +23,16 @@ target_link_libraries(catwhisper_tests
 
 include(GoogleTest)
 gtest_discover_tests(catwhisper_tests)
+
+# ROTRTA performance budget tests
+file(GLOB ROTRTA_TESTS "rotrta/*.cpp")
+add_executable(rotrta_tests ${ROTRTA_TESTS})
+
+target_link_libraries(rotrta_tests
+    PRIVATE
+        catwhisper::catwhisper
+        GTest::gtest
+        GTest::gtest_main
+)
+
+gtest_discover_tests(rotrta_tests)

@@ -83,6 +83,8 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         -Wall -Wextra -Wpedantic
         -Wno-unused-parameter
         -Werror=return-type
+        $<$<CONFIG:Release>:-march=native>
+        $<$<CONFIG:Release>:-ftree-vectorize>
     )
 elseif(MSVC)
     target_compile_options(catwhisper PRIVATE /W4 /wd4100)

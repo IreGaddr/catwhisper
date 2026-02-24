@@ -89,6 +89,11 @@ Expected<Buffer> Buffer::create(Context& ctx, const BufferDesc& desc) {
         case MemoryType::DeviceOnly:
             vma_usage = VMA_MEMORY_USAGE_GPU_ONLY;
             break;
+        case MemoryType::HostReadback:
+            // GPU writes, CPU reads: host-cached memory (system RAM) for fast CPU access.
+            // No DEVICE_LOCAL flag so GPU writes go through PCIe; CPU reads are cached.
+            vma_usage = VMA_MEMORY_USAGE_GPU_TO_CPU;
+            break;
         default:
             vma_usage = VMA_MEMORY_USAGE_GPU_ONLY;
     }

@@ -1,43 +1,36 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
-// Batch distance computation + top-k selection shader.
+// Batch fused distance + top-k shader using SoA database layout.
 //
-// Processes multiple queries in parallel using a 2D dispatch:
-// - X dimension: workgroups for vector chunks (each processes 512 vectors)
-// - Y dimension: query index
-//
-// Each workgroup computes distances for its chunk of vectors against one query,
-// sorts them, and writes top-k candidates. CPU merge step combines results.
+// Database layout: database[dimension_idx * capacity + vector_idx]   (SoA)
+// 2D dispatch: X = vector chunk index, Y = query index.
 
-layout(local_size_x = 256) in;
+layout(local_size_x = 1024) in;
 
-// Binding 0: database vectors (fp16)
 layout(set = 0, binding = 0) readonly buffer DatabaseBuffer {
     float16_t database[];
 };
 
-// Binding 1: query vectors (fp16), laid out as [n_queries * dimension]
 layout(set = 0, binding = 1) readonly buffer QueryBuffer {
-    float16_t queries[];
+    float16_t queries[];   // n_queries * dimension, row-major
 };
 
-// Binding 2: output partial top-k distances (n_queries * n_wg_per_query * k elements)
 layout(set = 0, binding = 2) buffer OutputDistances {
     float out_distances[];
 };
 
-// Binding 3: output partial top-k indices (n_queries * n_wg_per_query * k elements)
 layout(set = 0, binding = 3) buffer OutputIndices {
     uint out_indices[];
 };
 
 layout(push_constant) uniform PushConstants {
-    uint n_vectors;
+    uint n_vectors;   // live vectors in the database
     uint dimension;
     uint k;
     uint n_queries;
-    uint metric;  // 0 = L2, 1 = IP (negated for min-heap compatibility)
+    uint metric;      // 0 = L2, 1 = IP
+    uint capacity;    // SoA row stride (>= n_vectors)
 };
 
 struct Pair {
@@ -45,108 +38,94 @@ struct Pair {
     uint  idx;
 };
 
-const uint CHUNK = 512u;
+const uint CHUNK = 2048u;
 shared Pair sort_buf[CHUNK];
 
 void main() {
-    uint tid = gl_LocalInvocationID.x;    // in [0, 255]
-    uint wg_x = gl_WorkGroupID.x;          // vector chunk index
+    uint tid       = gl_LocalInvocationID.x;
+    uint wg_x      = gl_WorkGroupID.x;     // vector chunk index
     uint query_idx = gl_WorkGroupID.y;     // query index
-    
+
     uint base = wg_x * CHUNK;
-    
-    // ---- 1. Initialize shared memory with +infinity sentinel ----
+
     const float INF = uintBitsToFloat(0x7f800000u);
-    sort_buf[tid].dist        = INF;
-    sort_buf[tid].idx         = 0xFFFFFFFFu;
-    sort_buf[tid + 256u].dist = INF;
-    sort_buf[tid + 256u].idx  = 0xFFFFFFFFu;
-    
+    sort_buf[tid].dist          = INF;
+    sort_buf[tid].idx           = 0xFFFFFFFFu;
+    sort_buf[tid + 1024u].dist  = INF;
+    sort_buf[tid + 1024u].idx   = 0xFFFFFFFFu;
+
     barrier();
-    
-    // ---- 2. Compute distances for up to CHUNK vectors ----
+
     uint query_offset = query_idx * dimension;
-    
+
     uint pos0 = base + tid;
-    uint pos1 = base + tid + 256u;
-    
+    uint pos1 = base + tid + 1024u;
+
     if (pos0 < n_vectors) {
-        float dist0;
+        float sum = 0.0;
         if (metric == 0u) {
-            float sum = 0.0;
             for (uint d = 0u; d < dimension; ++d) {
-                float db_val = float(database[pos0 * dimension + d]);
-                float q_val = float(queries[query_offset + d]);
-                float diff = db_val - q_val;
+                float diff = float(database[d * capacity + pos0]) - float(queries[query_offset + d]);
                 sum += diff * diff;
             }
-            dist0 = sum;
         } else {
-            float sum = 0.0;
             for (uint d = 0u; d < dimension; ++d) {
-                float db_val = float(database[pos0 * dimension + d]);
-                float q_val = float(queries[query_offset + d]);
-                sum += db_val * q_val;
+                sum += float(database[d * capacity + pos0]) * float(queries[query_offset + d]);
             }
-            dist0 = -sum;
+            sum = -sum;
         }
-        sort_buf[tid].dist = dist0;
-        sort_buf[tid].idx = pos0;
+        sort_buf[tid].dist = sum;
+        sort_buf[tid].idx  = pos0;
     }
-    
+
     if (pos1 < n_vectors) {
-        float dist1;
+        float sum = 0.0;
         if (metric == 0u) {
-            float sum = 0.0;
             for (uint d = 0u; d < dimension; ++d) {
-                float db_val = float(database[pos1 * dimension + d]);
-                float q_val = float(queries[query_offset + d]);
-                float diff = db_val - q_val;
+                float diff = float(database[d * capacity + pos1]) - float(queries[query_offset + d]);
                 sum += diff * diff;
             }
-            dist1 = sum;
         } else {
-            float sum = 0.0;
             for (uint d = 0u; d < dimension; ++d) {
-                float db_val = float(database[pos1 * dimension + d]);
-                float q_val = float(queries[query_offset + d]);
-                sum += db_val * q_val;
+                sum += float(database[d * capacity + pos1]) * float(queries[query_offset + d]);
             }
-            dist1 = -sum;
+            sum = -sum;
         }
-        sort_buf[tid + 256u].dist = dist1;
-        sort_buf[tid + 256u].idx = pos1;
+        sort_buf[tid + 1024u].dist = sum;
+        sort_buf[tid + 1024u].idx  = pos1;
     }
-    
+
     barrier();
-    
-    // ---- 3. Ascending bitonic sort ----
+
+    // Bitonic sort on 2048 elements with 1024 threads (each handles 2 comparisons)
     for (uint bs = 2u; bs <= CHUNK; bs <<= 1u) {
         for (uint stride = bs >> 1u; stride >= 1u; stride >>= 1u) {
             barrier();
-            
-            uint i   = (tid & ~(stride - 1u)) * 2u + (tid & (stride - 1u));
-            uint ixj = i | stride;
-            
-            bool ascending = ((i & bs) == 0u);
-            bool need_swap = (sort_buf[i].dist > sort_buf[ixj].dist) == ascending;
-            
-            if (need_swap) {
-                Pair tmp      = sort_buf[i];
-                sort_buf[i]   = sort_buf[ixj];
-                sort_buf[ixj] = tmp;
+
+            for (uint j = 0u; j < 2u; ++j) {
+                uint ci = tid * 2u + j;
+                uint i   = (ci & ~(stride - 1u)) * 2u + (ci & (stride - 1u));
+                uint ixj = i | stride;
+
+                if (ixj < CHUNK) {
+                    bool ascending = ((i & bs) == 0u);
+                    bool need_swap = (sort_buf[i].dist > sort_buf[ixj].dist) == ascending;
+
+                    if (need_swap) {
+                        Pair tmp      = sort_buf[i];
+                        sort_buf[i]   = sort_buf[ixj];
+                        sort_buf[ixj] = tmp;
+                    }
+                }
             }
         }
     }
-    
+
     barrier();
-    
-    // ---- 4. Write top-k results ----
-    // Output layout: [query_idx * n_wg + wg_x] * k
-    uint n_wg_x = (n_vectors + CHUNK - 1u) / CHUNK;
+
+    uint n_wg_x   = (n_vectors + CHUNK - 1u) / CHUNK;
     uint out_base = (query_idx * n_wg_x + wg_x) * k;
-    
-    for (uint i = tid; i < k; i += 256u) {
+    for (uint i = tid; i < k; i += 1024u) {
         out_distances[out_base + i] = sort_buf[i].dist;
         out_indices[out_base + i]   = sort_buf[i].idx;
     }

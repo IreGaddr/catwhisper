@@ -13,6 +13,8 @@ set(SHADER_SOURCES
     topk_heap.comp
     distance_topk_fused.comp
     distance_topk_batch.comp
+    transpose_add.comp
+    soa_repack.comp
 )
 
 set(SHADER_OUTPUTS "")
