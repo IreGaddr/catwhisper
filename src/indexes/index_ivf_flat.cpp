@@ -167,6 +167,7 @@ struct IndexIVFFlat::Impl {
     std::vector<std::vector<float>> invlists_data;  // Temporary storage during building
     std::vector<std::vector<uint64_t>> invlists_ids;
     std::vector<uint64_t> flat_ids;  // Cached: IDs in cluster-major order
+    std::vector<uint32_t> cluster_soa_offsets;  // SoA start offsets per cluster (in fp16 units)
 
     // GPU buffers
     Buffer centroids_buffer;      // nlist * dimension fp32
@@ -176,9 +177,9 @@ struct IndexIVFFlat::Impl {
 
     // Search buffers
     Buffer query_buffer;          // dimension fp16
-    Buffer selected_clusters_buf; // nprobe uint32
-    Buffer result_dists_buffer;   // k floats
-    Buffer result_idxs_buffer;    // k uints
+    Buffer cluster_info_buffer;   // nprobe * sizeof(uvec4)
+    Buffer result_dists_buffer;   // nprobe * k floats
+    Buffer result_idxs_buffer;    // nprobe * k uints
 
     // Pipeline
     Pipeline search_pipeline;
@@ -232,15 +233,13 @@ Expected<void> IndexIVFFlat::init_pipelines() {
         PipelineDesc desc;
         desc.shader_name = "ivf_distance";
         desc.bindings = {
-            {0, DescriptorBinding::StorageBuffer},  // centroids
-            {1, DescriptorBinding::StorageBuffer},  // cluster_offsets
-            {2, DescriptorBinding::StorageBuffer},  // data
-            {3, DescriptorBinding::StorageBuffer},  // query
-            {4, DescriptorBinding::StorageBuffer},  // selected_clusters
-            {5, DescriptorBinding::StorageBuffer},  // out_distances
-            {6, DescriptorBinding::StorageBuffer},  // out_indices
+            {0, DescriptorBinding::StorageBuffer},  // cluster_data
+            {1, DescriptorBinding::StorageBuffer},  // cluster_info
+            {2, DescriptorBinding::StorageBuffer},  // query
+            {3, DescriptorBinding::StorageBuffer},  // out_distances
+            {4, DescriptorBinding::StorageBuffer},  // out_indices
         };
-        desc.push_constant_size = 20;  // n_clusters, dimension, k, nprobe, metric
+        desc.push_constant_size = 16;  // dimension, k, metric, pad
 
         auto result = Pipeline::create(*impl_->ctx, desc);
         if (!result) {
@@ -451,7 +450,8 @@ Expected<void> IndexIVFFlat::upload_to_gpu() {
         impl_->cluster_offsets[c + 1] = impl_->cluster_offsets[c] + static_cast<uint32_t>(impl_->invlists_ids[c].size());
     }
 
-    // Build cluster-major data buffer (fp16)
+    // Build cluster data buffer in SoA format (per-cluster SoA)
+    // For cluster c with n vectors: data[c_start + d * n + v] = dim d of vector v
     uint64_t data_size = impl_->n_vectors * impl_->dimension * sizeof(uint16_t);
 
     if (!impl_->data_buffer.valid() || impl_->data_buffer.size() < data_size) {
@@ -465,13 +465,22 @@ Expected<void> IndexIVFFlat::upload_to_gpu() {
         impl_->data_buffer = std::move(*buf);
     }
 
-    // Flatten data in cluster-major order
+    // Flatten data in per-cluster SoA format
     std::vector<uint16_t> flat_data(impl_->n_vectors * impl_->dimension);
-    uint64_t offset = 0;
+    uint64_t write_pos = 0;
+
+    // Track byte offsets for each cluster (in fp16 units)
+    impl_->cluster_soa_offsets.resize(impl_->actual_nlist);
+
     for (uint32_t c = 0; c < impl_->actual_nlist; ++c) {
-        for (size_t v = 0; v < impl_->invlists_data[c].size() / impl_->dimension; ++v) {
-            for (uint32_t d = 0; d < impl_->dimension; ++d) {
-                flat_data[offset++] = float_to_half(impl_->invlists_data[c][v * impl_->dimension + d]);
+        uint32_t cluster_size = impl_->cluster_offsets[c + 1] - impl_->cluster_offsets[c];
+        impl_->cluster_soa_offsets[c] = write_pos;  // Offset in fp16 units
+
+        // SoA: for each dimension, write all vectors in this cluster
+        for (uint32_t d = 0; d < impl_->dimension; ++d) {
+            for (uint32_t v = 0; v < cluster_size; ++v) {
+                float val = impl_->invlists_data[c][v * impl_->dimension + d];
+                flat_data[write_pos++] = float_to_half(val);
             }
         }
     }
@@ -562,20 +571,62 @@ Expected<SearchResults> IndexIVFFlat::search(Vector query, uint32_t k) {
         }
     }
 
-    // Allocate selected clusters buffer (shader writes to it)
-    if (!impl_->selected_clusters_buf.valid() || impl_->selected_clusters_buf.size() < impl_->params.nlist * sizeof(uint32_t)) {
-        BufferDesc desc = {};
-        desc.size = impl_->params.nlist * sizeof(uint32_t);
-        desc.usage = BufferUsage::Storage;
-        desc.memory_type = MemoryType::DeviceLocal;
-
-        auto buf = Buffer::create(*impl_->ctx, desc);
-        if (!buf) return make_unexpected(buf.error().code(), "Failed to create selected clusters buffer");
-        impl_->selected_clusters_buf = std::move(*buf);
+    // CPU: Select top-nprobe centroids
+    std::vector<std::pair<float, uint32_t>> centroid_dists;
+    centroid_dists.reserve(impl_->actual_nlist);
+    for (uint32_t c = 0; c < impl_->actual_nlist; ++c) {
+        float dist = 0.0f;
+        if (impl_->metric == Metric::L2) {
+            for (uint32_t d = 0; d < impl_->dimension; ++d) {
+                float diff = query[d] - impl_->centroids[c * impl_->dimension + d];
+                dist += diff * diff;
+            }
+        } else {
+            for (uint32_t d = 0; d < impl_->dimension; ++d) {
+                dist += query[d] * impl_->centroids[c * impl_->dimension + d];
+            }
+            dist = -dist;
+        }
+        centroid_dists.emplace_back(dist, c);
+    }
+    
+    // Partial sort to get top-nprobe
+    std::partial_sort(centroid_dists.begin(), centroid_dists.begin() + nprobe, centroid_dists.end());
+    
+    std::vector<uint32_t> selected_clusters;
+    selected_clusters.reserve(nprobe);
+    for (uint32_t p = 0; p < nprobe; ++p) {
+        selected_clusters.push_back(centroid_dists[p].second);
     }
 
-    // Allocate result buffers
-    uint64_t result_size = k * sizeof(float);
+    // Allocate cluster_info buffer for nprobe clusters (uvec4 per cluster)
+    uint64_t cluster_info_size = nprobe * sizeof(uint32_t) * 4;
+    if (!impl_->cluster_info_buffer.valid() || impl_->cluster_info_buffer.size() < cluster_info_size) {
+        BufferDesc desc = {};
+        desc.size = cluster_info_size;
+        desc.usage = BufferUsage::Storage | BufferUsage::TransferDst;
+        desc.memory_type = MemoryType::HostCoherent;
+        desc.map_on_create = true;
+
+        auto buf = Buffer::create(*impl_->ctx, desc);
+        if (!buf) return make_unexpected(buf.error().code(), "Failed to create cluster info buffer");
+        impl_->cluster_info_buffer = std::move(*buf);
+    }
+
+    // Populate cluster_info buffer (SoA offsets in fp16 units)
+    {
+        uint32_t* mapped = reinterpret_cast<uint32_t*>(impl_->cluster_info_buffer.mapped());
+        for (uint32_t p = 0; p < nprobe; ++p) {
+            uint32_t cluster = selected_clusters[p];
+            mapped[p * 4 + 0] = impl_->cluster_soa_offsets[cluster];  // SoA offset in fp16 units
+            mapped[p * 4 + 1] = impl_->cluster_offsets[cluster + 1] - impl_->cluster_offsets[cluster];  // size
+            mapped[p * 4 + 2] = p;  // output_slot
+            mapped[p * 4 + 3] = cluster;  // Store actual cluster ID for index conversion
+        }
+    }
+
+    // Allocate result buffers for nprobe * k results
+    uint64_t result_size = nprobe * k * sizeof(float);
     if (!impl_->result_dists_buffer.valid() || impl_->result_dists_buffer.size() < result_size) {
         BufferDesc desc = {};
         desc.size = result_size;
@@ -586,27 +637,36 @@ Expected<SearchResults> IndexIVFFlat::search(Vector query, uint32_t k) {
         auto buf = Buffer::create(*impl_->ctx, desc);
         if (!buf) return make_unexpected(buf.error().code(), "Failed to create result distances buffer");
         impl_->result_dists_buffer = std::move(*buf);
+    }
 
-        buf = Buffer::create(*impl_->ctx, desc);
+    result_size = nprobe * k * sizeof(uint32_t);
+    if (!impl_->result_idxs_buffer.valid() || impl_->result_idxs_buffer.size() < result_size) {
+        BufferDesc desc = {};
+        desc.size = result_size;
+        desc.usage = BufferUsage::Storage | BufferUsage::TransferSrc;
+        desc.memory_type = MemoryType::HostReadback;
+        desc.map_on_create = true;
+
+        auto buf = Buffer::create(*impl_->ctx, desc);
         if (!buf) return make_unexpected(buf.error().code(), "Failed to create result indices buffer");
         impl_->result_idxs_buffer = std::move(*buf);
     }
 
-    // Bind descriptor set
-    auto bind0 = impl_->search_desc_set.bind_buffer(0, impl_->centroids_buffer);
-    auto bind1 = impl_->search_desc_set.bind_buffer(1, impl_->offsets_buffer);
-    auto bind2 = impl_->search_desc_set.bind_buffer(2, impl_->data_buffer);
-    auto bind3 = impl_->search_desc_set.bind_buffer(3, impl_->query_buffer);
-    auto bind4 = impl_->search_desc_set.bind_buffer(4, impl_->selected_clusters_buf);
-    auto bind5 = impl_->search_desc_set.bind_buffer(5, impl_->result_dists_buffer);
-    auto bind6 = impl_->search_desc_set.bind_buffer(6, impl_->result_idxs_buffer);
+    // Bind descriptor set (new interface)
+    auto bind0 = impl_->search_desc_set.bind_buffer(0, impl_->data_buffer);
+    auto bind1 = impl_->search_desc_set.bind_buffer(1, impl_->cluster_info_buffer);
+    auto bind2 = impl_->search_desc_set.bind_buffer(2, impl_->query_buffer);
+    auto bind3 = impl_->search_desc_set.bind_buffer(3, impl_->result_dists_buffer);
+    auto bind4 = impl_->search_desc_set.bind_buffer(4, impl_->result_idxs_buffer);
 
-    if (!bind0 || !bind1 || !bind2 || !bind3 || !bind4 || !bind5 || !bind6) {
+    if (!bind0 || !bind1 || !bind2 || !bind3 || !bind4) {
         return make_unexpected(ErrorCode::OperationFailed, "Failed to bind descriptor set");
     }
 
-    // Record or reuse command buffer
-    bool need_rerecord = !impl_->search_cmd_valid || impl_->search_cmd_k != k || impl_->search_cmd_nprobe != nprobe;
+    // ---- Record or reuse command buffer ----
+    bool need_rerecord = !impl_->search_cmd_valid ||
+                         impl_->search_cmd_k != k ||
+                         impl_->search_cmd_nprobe != nprobe;
 
     if (need_rerecord) {
         if (!impl_->search_cmd.valid()) {
@@ -618,24 +678,22 @@ Expected<SearchResults> IndexIVFFlat::search(Vector query, uint32_t k) {
         }
 
         struct PushConstants {
-            uint32_t n_clusters;
             uint32_t dimension;
             uint32_t k;
-            uint32_t nprobe;
             uint32_t metric;
+            uint32_t pad0;
         } pc = {
-            impl_->actual_nlist,
             impl_->dimension,
             k,
-            nprobe,
-            (impl_->metric == Metric::IP) ? 1u : 0u
+            (impl_->metric == Metric::IP) ? 1u : 0u,
+            0u
         };
 
-        impl_->search_cmd.begin();
+        impl_->search_cmd.begin_reusable();
         impl_->search_cmd.bind_pipeline(impl_->search_pipeline);
         impl_->search_cmd.bind_descriptor_set(impl_->search_pipeline, impl_->search_desc_set);
         impl_->search_cmd.push_constants(impl_->search_pipeline, &pc, sizeof(pc));
-        impl_->search_cmd.dispatch(1);  // Single workgroup
+        impl_->search_cmd.dispatch(nprobe);
         impl_->search_cmd.end();
 
         impl_->search_cmd_valid = true;
@@ -647,17 +705,37 @@ Expected<SearchResults> IndexIVFFlat::search(Vector query, uint32_t k) {
     auto submit_result = submit_and_wait(*impl_->ctx, impl_->search_cmd);
     if (!submit_result) return make_unexpected(submit_result.error().code(), submit_result.error().message());
 
-    // Read results
+    // Read and merge results from all clusters
+    // Shader returns local position within cluster; need to convert to global index
     const float* dists = reinterpret_cast<const float*>(impl_->result_dists_buffer.mapped());
     const uint32_t* idxs = reinterpret_cast<const uint32_t*>(impl_->result_idxs_buffer.mapped());
 
-    // Map buffer indices to external IDs using cached flat_ids
-    SearchResults results(1, k);
-    for (uint32_t i = 0; i < k; ++i) {
-        if (idxs[i] != 0xFFFFFFFFu && idxs[i] < impl_->n_vectors) {
-            results.results[i].distance = dists[i];
-            results.results[i].id = impl_->flat_ids[idxs[i]];
+    // Collect all results from all clusters, converting local pos to global index
+    std::vector<std::pair<float, uint32_t>> all_results;
+    all_results.reserve(nprobe * k);
+    for (uint32_t p = 0; p < nprobe; ++p) {
+        uint32_t cluster = selected_clusters[p];
+        uint32_t cluster_start = impl_->cluster_offsets[cluster];  // Start in flat_ids
+        for (uint32_t i = 0; i < k; ++i) {
+            uint32_t local_pos = idxs[p * k + i];
+            if (local_pos != 0xFFFFFFFFu && local_pos < impl_->cluster_offsets[cluster + 1] - impl_->cluster_offsets[cluster]) {
+                uint32_t global_idx = cluster_start + local_pos;
+                all_results.emplace_back(dists[p * k + i], global_idx);
+            }
         }
+    }
+
+    // Sort and take top-k
+    std::partial_sort(all_results.begin(), 
+                      all_results.begin() + std::min(k, static_cast<uint32_t>(all_results.size())),
+                      all_results.end());
+    all_results.resize(std::min(k, static_cast<uint32_t>(all_results.size())));
+
+    // Map buffer indices to external IDs
+    SearchResults results(1, k);
+    for (size_t i = 0; i < all_results.size(); ++i) {
+        results.results[i].distance = all_results[i].first;
+        results.results[i].id = impl_->flat_ids[all_results[i].second];
     }
 
     return results;

@@ -33,11 +33,11 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 CONFIGS = [
-    dict(n_vectors=10_000,   dim=128, k=10, label="10K  x128"),
-    dict(n_vectors=100_000,  dim=128, k=10, label="100K x128"),
-    dict(n_vectors=100_000,  dim=256, k=10, label="100K x256"),
+    dict(n_vectors=10_000,   dim=128, k=10, label="10K  x128", nlist=32,  nprobe=16),
+    dict(n_vectors=100_000,  dim=128, k=10, label="100K x128", nlist=64,  nprobe=16),
+    dict(n_vectors=100_000,  dim=256, k=10, label="100K x256", nlist=64,  nprobe=16),
 ]
-LARGE_CONFIG = dict(n_vectors=1_000_000, dim=128, k=10, label="1M   x128")
+LARGE_CONFIG = dict(n_vectors=1_000_000, dim=128, k=10, label="1M   x128", nlist=256, nprobe=32)
 
 N_WARMUP = 20    # queries discarded for warmup
 N_BENCH  = 200   # queries timed
@@ -202,6 +202,50 @@ def main():
 
             except Exception as e:
                 print(f"  [GPU] FAILED: {e}")
+
+        # ----------------------------------------------------------------
+        # FAISS CPU IVF
+        # ----------------------------------------------------------------
+        nlist = cfg.get("nlist", 32)
+        nprobe = cfg.get("nprobe", 16)
+        
+        try:
+            quantizer = faiss.IndexFlatL2(dim)
+            cpu_ivf = faiss.IndexIVFFlat(quantizer, dim, nlist)
+            cpu_ivf.nprobe = nprobe
+            
+            t0 = time.perf_counter()
+            cpu_ivf.train(data)
+            cpu_ivf.add(data)
+            train_add_cpu_ms = (time.perf_counter() - t0) * 1000.0
+            print(f"  [CPU IVF] Train+Add: {train_add_cpu_ms:.1f} ms (nlist={nlist}, nprobe={nprobe})")
+            
+            single_cpu_ivf = bench_index(cpu_ivf, queries, k)
+            print_stats(f"CPU IVF single nprobe={nprobe}", single_cpu_ivf)
+            results.append((lbl, f"faiss-cpu-ivf-nprobe{nprobe}", single_cpu_ivf))
+        except Exception as e:
+            print(f"  [CPU IVF] FAILED: {e}")
+
+        # ----------------------------------------------------------------
+        # FAISS GPU IVF
+        # ----------------------------------------------------------------
+        if gpu_available:
+            try:
+                quantizer_gpu = faiss.index_cpu_to_gpu(res, 0, faiss.IndexFlatL2(dim))
+                gpu_ivf = faiss.GpuIndexIVFFlat(res, quantizer_gpu, dim, nlist, faiss.METRIC_L2)
+                gpu_ivf.nprobe = nprobe
+                
+                t0 = time.perf_counter()
+                gpu_ivf.train(data)
+                gpu_ivf.add(data)
+                train_add_gpu_ms = (time.perf_counter() - t0) * 1000.0
+                print(f"  [GPU IVF] Train+Add: {train_add_gpu_ms:.1f} ms (nlist={nlist}, nprobe={nprobe})")
+                
+                single_gpu_ivf = bench_index(gpu_ivf, queries, k)
+                print_stats(f"GPU IVF single nprobe={nprobe}", single_gpu_ivf)
+                results.append((lbl, f"faiss-gpu-ivf-nprobe{nprobe}", single_gpu_ivf))
+            except Exception as e:
+                print(f"  [GPU IVF] FAILED: {e}")
 
         print()
 

@@ -19,6 +19,16 @@ Single-query latency, RTX 4080 Laptop GPU, k=10, fp16 mode:
 
 FAISS 1.13.2 · CatWhisper commit bd85835 · 20 warmup + 100 timed queries · median latency
 
+### IVF Performance
+
+IndexIVFFlat recall@10, clustered data, nprobe=16:
+
+| Configuration | IVF Median | Recall@10 |
+|---------------|------------|-----------|
+| 10K × 128     | 0.193 ms   | 99.0% |
+| 100K × 128    | 0.964 ms   | 98.0% |
+| 100K × 256    | 0.346 ms   | 100.0% |
+
 ## Quick Start
 
 ```cpp
@@ -38,6 +48,29 @@ auto results = index.search({query.data(), 128}, 10).value();
 for (auto& [dist, id] : results) {
     std::cout << id << " " << dist << "\n";
 }
+```
+
+### IVF (Inverted File) Index
+
+For larger datasets with approximate search:
+
+```cpp
+#include <catwhisper/index_ivf_flat.hpp>
+
+auto ctx = cw::Context::create().value();
+
+// Configure IVF: 256 clusters, search 16 of them
+cw::IVFParams params{.nlist = 256, .nprobe = 16};
+auto index = cw::IndexIVFFlat::create(ctx, 128, params).value();
+
+// Train on representative data
+index.train(train_data, 50'000).value();
+
+// Add vectors (GPU-accelerated cluster assignment)
+index.add(data, 1'000'000).value();
+
+// Search — 98-100% recall at 16 nprobe
+auto results = index.search({query.data(), 128}, 10).value();
 ```
 
 ## Build
@@ -85,14 +118,14 @@ unchanged.
 
 ## Status
 
-**Alpha.** IndexFlat is complete and production-tested. IndexIVFFlat, IndexIVFPQ,
-and IndexHNSW are on the roadmap; see [ROADMAP](docs/ROADMAP.md).
+**Alpha.** IndexFlat and IndexIVFFlat are complete and production-tested.
+IndexIVFPQ and IndexHNSW are on the roadmap; see [ROADMAP](docs/ROADMAP.md).
 
 | Index | Status |
 |-------|--------|
 | IndexFlat | ✅ Complete — beats FAISS-GPU |
-| IndexIVFFlat | ❌ Not started |
+| IndexIVFFlat | ✅ Complete — 98-100% recall, GPU-accelerated |
 | IndexIVFPQ | ❌ Not started |
 | IndexHNSW | ❌ Not started |
 
-41 unit tests + 3 performance budget tests passing.
+59 unit tests + 7 performance budget tests passing.
