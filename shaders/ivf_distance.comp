@@ -1,38 +1,38 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_shuffle : require
 
-// IVF search: compute distances and top-k within selected clusters
+// IVF search: compute distances within selected clusters and select top-k
+// Handles centroid selection on GPU (no CPU-bound operations)
 
-layout(local_size_x = 512) in;
+layout(local_size_x = 256) in;
 
 layout(binding = 0) buffer CentroidsBuffer {
     float centroids[];  // n_clusters * dimension (fp32)
 };
 
 layout(binding = 1) buffer ClusterOffsets {
-    uint offsets[];  // n_clusters + 1, offsets into cluster_data
+    uint cluster_offsets[];  // n_clusters + 1
 };
 
-layout(binding = 2) buffer ClusterData {
-    uint16_t data[];  // fp16 vectors stored cluster-by-cluster
+layout(binding = 2) buffer DataBuffer {
+    float16_t data[];  // fp16 vectors, cluster-major layout
 };
 
 layout(binding = 3) buffer QueryBuffer {
-    uint16_t query[];  // fp16 query vector
+    float16_t query[];  // fp16 query vector
 };
 
 layout(binding = 4) buffer SelectedClusters {
-    uint selected[];  // nprobe cluster indices to search
+    uint selected_clusters[];  // nprobe cluster indices (output from centroid selection)
 };
 
 layout(binding = 5) buffer OutDistances {
-    float out_distances[];  // partial distances (n_wg * k)
+    float out_distances[];  // k results
 };
 
 layout(binding = 6) buffer OutIndices {
-    uint out_indices[];  // partial indices (n_wg * k)
+    uint out_indices[];  // k results (buffer indices)
 };
 
 layout(push_constant) uniform PushConstants {
@@ -40,128 +40,170 @@ layout(push_constant) uniform PushConstants {
     uint dimension;
     uint k;
     uint nprobe;
-    uint total_vectors;
     uint metric;  // 0 = L2, 1 = IP
 } pc;
 
-// Bitonic sort helpers for top-k
-void bitonic_sort_step(inout float dists[64], inout uint idxs[64], uint stage, uint step) {
-    for (uint i = 0; i < 64; ++i) {
-        uint j = i ^ (1u << step);
-        if (j > i && j < 64) {
-            bool swap = ((i >> (stage + 1u)) & 1u) == 0u;
-            if (swap == (dists[i] > dists[j])) {
-                float tmp_d = dists[i];
-                dists[i] = dists[j];
-                dists[j] = tmp_d;
-                uint tmp_i = idxs[i];
-                idxs[i] = idxs[j];
-                idxs[j] = tmp_i;
-            }
-        }
-    }
-}
-
 shared float16_t shared_query[128];
+shared float shared_centroid_dists[256];  // Per-thread centroid distance
+shared uint shared_centroid_ids[256];     // Per-thread centroid id
+shared uint shared_selected[32];          // Selected cluster indices (max nprobe)
 
 void main() {
     uint local_id = gl_LocalInvocationID.x;
-    uint workgroup_id = gl_WorkGroupID.x;
+    uint wg_size = gl_WorkGroupSize.x;
 
     // Load query into shared memory
-    if (local_id < pc.dimension) {
-        shared_query[local_id] = float16_t(query[local_id]);
+    for (uint d = local_id; d < pc.dimension; d += wg_size) {
+        shared_query[d] = query[d];
     }
     barrier();
 
-    // Each workgroup processes vectors from selected clusters
-    // We iterate through all vectors in the nprobe selected clusters
+    // ============================================
+    // Phase 1: Select top-nprobe centroids
+    // ============================================
 
-    // Calculate total vectors to search
-    uint total_to_search = 0u;
-    for (uint p = 0; p < pc.nprobe; ++p) {
-        uint cluster = selected[p];
-        uint cluster_size = offsets[cluster + 1u] - offsets[cluster];
-        total_to_search += cluster_size;
+    // Each thread computes distance to its assigned centroids
+    float best_dist = 1e30f;
+    uint best_cluster = 0xFFFFFFFFu;
+
+    for (uint c = local_id; c < pc.n_clusters; c += wg_size) {
+        float dist = 0.0f;
+        if (pc.metric == 0u) {
+            for (uint d = 0u; d < pc.dimension; ++d) {
+                float diff = float(shared_query[d]) - centroids[c * pc.dimension + d];
+                dist += diff * diff;
+            }
+        } else {
+            for (uint d = 0u; d < pc.dimension; ++d) {
+                dist += float(shared_query[d]) * centroids[c * pc.dimension + d];
+            }
+            dist = -dist;
+        }
+
+        if (dist < best_dist) {
+            best_dist = dist;
+            best_cluster = c;
+        }
     }
 
-    // Top-k heap for this workgroup
-    float heap_dists[64];
-    uint heap_idxs[64];
+    shared_centroid_dists[local_id] = best_dist;
+    shared_centroid_ids[local_id] = best_cluster;
+    barrier();
 
-    for (uint i = 0; i < 64u; ++i) {
-        heap_dists[i] = 1e30f;
-        heap_idxs[i] = 0xFFFFFFFFu;
-    }
+    // Thread 0 selects top-nprobe by scanning all results nprobe times
+    if (local_id == 0u) {
+        for (uint p = 0u; p < pc.nprobe; ++p) {
+            float best = 1e30f;
+            uint best_i = 0xFFFFFFFFu;
 
-    // Process vectors
-    uint vectors_per_thread = (total_to_search + gl_WorkGroupSize.x - 1u) / gl_WorkGroupSize.x;
-    uint start_vec = local_id * vectors_per_thread;
-
-    uint vec_count = 0u;
-    for (uint p = 0u; p < pc.nprobe; ++p) {
-        uint cluster = selected[p];
-        uint cluster_start = offsets[cluster];
-        uint cluster_size = offsets[cluster + 1u] - cluster_start;
-
-        for (uint v = 0u; v < cluster_size; ++v) {
-            uint global_vec_idx = vec_count + v;
-            if (global_vec_idx >= start_vec && global_vec_idx < start_vec + vectors_per_thread) {
-                // Compute distance
-                float dist = 0.0f;
-                uint vec_offset = (cluster_start + v) * pc.dimension;
-
-                if (pc.metric == 0u) {
-                    // L2 distance
-                    for (uint d = 0u; d < pc.dimension; ++d) {
-                        float diff = float(shared_query[d]) - float(data[vec_offset + d]);
-                        dist += diff * diff;
-                    }
-                } else {
-                    // Inner product (negated)
-                    for (uint d = 0u; d < pc.dimension; ++d) {
-                        dist += float(shared_query[d]) * float(data[vec_offset + d]);
-                    }
-                    dist = -dist;
-                }
-
-                // Insert into heap
-                if (dist < heap_dists[pc.k - 1u]) {
-                    heap_dists[pc.k - 1u] = dist;
-                    heap_idxs[pc.k - 1u] = cluster_start + v;
-
-                    // Bubble up
-                    uint idx = pc.k - 1u;
-                    while (idx > 0u && heap_dists[idx] < heap_dists[idx - 1u]) {
-                        float tmp_d = heap_dists[idx];
-                        heap_dists[idx] = heap_dists[idx - 1u];
-                        heap_dists[idx - 1u] = tmp_d;
-
-                        uint tmp_i = heap_idxs[idx];
-                        heap_idxs[idx] = heap_idxs[idx - 1u];
-                        heap_idxs[idx - 1u] = tmp_i;
-
-                        --idx;
-                    }
+            for (uint i = 0u; i < wg_size; ++i) {
+                if (shared_centroid_dists[i] < best) {
+                    best = shared_centroid_dists[i];
+                    best_i = i;
                 }
             }
-        }
-        vec_count += cluster_size;
-    }
 
+            if (best_i != 0xFFFFFFFFu) {
+                shared_selected[p] = shared_centroid_ids[best_i];
+                shared_centroid_dists[best_i] = 1e30f;  // Mark as used
+
+                // Also write to output buffer for debugging/verification
+                selected_clusters[p] = shared_centroid_ids[best_i];
+            } else {
+                shared_selected[p] = 0xFFFFFFFFu;
+                selected_clusters[p] = 0xFFFFFFFFu;
+            }
+        }
+    }
     barrier();
 
-    // Now reduce across threads to get workgroup top-k
-    // For simplicity, use subgroup operations
+    // ============================================
+    // Phase 2: Search selected clusters
+    // ============================================
 
-    // Each thread writes its best k to shared memory
-    // Then thread 0 merges all
+    // Calculate total vectors in selected clusters
+    uint total_vectors = 0u;
+    for (uint p = 0u; p < pc.nprobe; ++p) {
+        uint cluster = shared_selected[p];
+        if (cluster != 0xFFFFFFFFu && cluster < pc.n_clusters) {
+            total_vectors += cluster_offsets[cluster + 1u] - cluster_offsets[cluster];
+        }
+    }
 
-    // Output workgroup results
+    if (total_vectors == 0u) {
+        if (local_id == 0u) {
+            for (uint i = 0u; i < pc.k; ++i) {
+                out_distances[i] = 1e30f;
+                out_indices[i] = 0xFFFFFFFFu;
+            }
+        }
+        return;
+    }
+
+    // Each thread processes strided subset of all vectors
+    float thread_best_dist = 1e30f;
+    uint thread_best_idx = 0xFFFFFFFFu;
+
+    uint vec_idx = local_id;
+
+    for (uint p = 0u; p < pc.nprobe; ++p) {
+        uint cluster = shared_selected[p];
+        if (cluster == 0xFFFFFFFFu || cluster >= pc.n_clusters) continue;
+
+        uint cluster_start = cluster_offsets[cluster];
+        uint cluster_end = cluster_offsets[cluster + 1u];
+        uint cluster_size = cluster_end - cluster_start;
+
+        // Process vectors in this cluster with stride
+        for (uint v = local_id; v < cluster_size; v += wg_size) {
+            uint data_offset = (cluster_start + v) * pc.dimension;
+
+            float dist = 0.0f;
+            if (pc.metric == 0u) {
+                for (uint d = 0u; d < pc.dimension; ++d) {
+                    float diff = float(shared_query[d]) - float(data[data_offset + d]);
+                    dist += diff * diff;
+                }
+            } else {
+                for (uint d = 0u; d < pc.dimension; ++d) {
+                    dist += float(shared_query[d]) * float(data[data_offset + d]);
+                }
+                dist = -dist;
+            }
+
+            if (dist < thread_best_dist) {
+                thread_best_dist = dist;
+                thread_best_idx = cluster_start + v;
+            }
+        }
+    }
+
+    // Store per-thread best
+    shared_centroid_dists[local_id] = thread_best_dist;
+    shared_centroid_ids[local_id] = thread_best_idx;
+    barrier();
+
+    // Thread 0 finds top-k by scanning all results k times
     if (local_id == 0u) {
-        for (uint i = 0u; i < pc.k; ++i) {
-            out_distances[workgroup_id * pc.k + i] = heap_dists[i];
-            out_indices[workgroup_id * pc.k + i] = heap_idxs[i];
+        for (uint k_idx = 0u; k_idx < pc.k; ++k_idx) {
+            float best = 1e30f;
+            uint best_i = 0xFFFFFFFFu;
+
+            for (uint i = 0u; i < wg_size; ++i) {
+                if (shared_centroid_dists[i] < best) {
+                    best = shared_centroid_dists[i];
+                    best_i = i;
+                }
+            }
+
+            if (best_i != 0xFFFFFFFFu) {
+                out_distances[k_idx] = shared_centroid_dists[best_i];
+                out_indices[k_idx] = shared_centroid_ids[best_i];
+                shared_centroid_dists[best_i] = 1e30f;  // Mark as used
+            } else {
+                out_distances[k_idx] = 1e30f;
+                out_indices[k_idx] = 0xFFFFFFFFu;
+            }
         }
     }
 }

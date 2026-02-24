@@ -9,11 +9,32 @@
 #include <cmath>
 #include <random>
 #include <limits>
-#include <set>
 
 namespace cw {
 
-// K-means clustering implementation (CPU)
+// Float32 to float16 conversion
+static uint16_t float_to_half(float f) {
+    uint32_t bits;
+    std::memcpy(&bits, &f, sizeof(float));
+
+    uint32_t sign = (bits >> 31) & 1;
+    int32_t exponent = ((bits >> 23) & 0xFF) - 127;
+    uint32_t mantissa = bits & 0x7FFFFF;
+
+    if (exponent > 15) {
+        return static_cast<uint16_t>((sign << 15) | 0x7C00);
+    }
+    if (exponent < -14) {
+        return static_cast<uint16_t>(sign << 15);
+    }
+
+    int32_t new_exp = exponent + 15;
+    uint32_t new_mant = mantissa >> 13;
+
+    return static_cast<uint16_t>((sign << 15) | (new_exp << 10) | new_mant);
+}
+
+// K-means clustering (CPU - done once during training)
 class KMeans {
 public:
     KMeans(uint32_t n_clusters, uint32_t dimension, uint32_t max_iters, Metric metric)
@@ -31,8 +52,7 @@ public:
 
         for (uint32_t iter = 0; iter < max_iters_; ++iter) {
             assign_clusters(data, n_samples, centroids.data(), assignments.data());
-            bool converged = update_centroids(data, n_samples, assignments.data(), centroids.data());
-            if (converged) break;
+            if (update_centroids(data, n_samples, assignments.data(), centroids.data())) break;
         }
 
         return centroids;
@@ -59,9 +79,7 @@ private:
             double total_dist = 0.0;
             for (uint64_t i = 0; i < n_samples; ++i) {
                 double dist = compute_distance(data + i * dimension_, centroids + (c - 1) * dimension_);
-                if (dist < min_distances[i]) {
-                    min_distances[i] = dist;
-                }
+                if (dist < min_distances[i]) min_distances[i] = dist;
                 total_dist += min_distances[i];
             }
 
@@ -71,10 +89,7 @@ private:
             uint64_t next_idx = 0;
             for (uint64_t i = 0; i < n_samples; ++i) {
                 cumulative += min_distances[i];
-                if (cumulative >= threshold) {
-                    next_idx = i;
-                    break;
-                }
+                if (cumulative >= threshold) { next_idx = i; break; }
             }
 
             std::memcpy(centroids + c * dimension_, data + next_idx * dimension_, dimension_ * sizeof(float));
@@ -97,25 +112,19 @@ private:
         return dist;
     }
 
-    void assign_clusters(const float* data, uint64_t n_samples,
-                         const float* centroids, uint32_t* assignments) {
+    void assign_clusters(const float* data, uint64_t n_samples, const float* centroids, uint32_t* assignments) {
         for (uint64_t i = 0; i < n_samples; ++i) {
             double min_dist = std::numeric_limits<double>::max();
-            uint32_t best_cluster = 0;
-
+            uint32_t best = 0;
             for (uint32_t c = 0; c < n_clusters_; ++c) {
                 double dist = compute_distance(data + i * dimension_, centroids + c * dimension_);
-                if (dist < min_dist) {
-                    min_dist = dist;
-                    best_cluster = c;
-                }
+                if (dist < min_dist) { min_dist = dist; best = c; }
             }
-            assignments[i] = best_cluster;
+            assignments[i] = best;
         }
     }
 
-    bool update_centroids(const float* data, uint64_t n_samples,
-                          const uint32_t* assignments, float* centroids) {
+    bool update_centroids(const float* data, uint64_t n_samples, const uint32_t* assignments, float* centroids) {
         std::vector<double> new_centroids(n_clusters_ * dimension_, 0.0);
         std::vector<uint64_t> counts(n_clusters_, 0);
 
@@ -132,14 +141,11 @@ private:
             if (counts[c] > 0) {
                 for (uint32_t d = 0; d < dimension_; ++d) {
                     float new_val = static_cast<float>(new_centroids[c * dimension_ + d] / counts[c]);
-                    if (std::abs(new_val - centroids[c * dimension_ + d]) > 1e-6f) {
-                        converged = false;
-                    }
+                    if (std::abs(new_val - centroids[c * dimension_ + d]) > 1e-6f) converged = false;
                     centroids[c * dimension_ + d] = new_val;
                 }
             }
         }
-
         return converged;
     }
 };
@@ -148,41 +154,57 @@ struct IndexIVFFlat::Impl {
     Context* ctx = nullptr;
     uint32_t dimension = 0;
     uint64_t n_vectors = 0;
+    uint64_t capacity = 0;
     Metric metric = Metric::L2;
     bool use_fp16 = true;
 
     IVFParams params;
-
-    // Trained centroids (nlist * dimension floats)
-    std::vector<float> centroids;
     uint32_t actual_nlist = 0;
 
-    // For CPU-based search, store vectors cluster-by-cluster
-    // invlists_data[c] = raw vector data for cluster c (dimension floats each)
-    std::vector<std::vector<float>> invlists_data;
-    // invlists_ids[c] = vector IDs for cluster c
-    std::vector<std::vector<VectorId>> invlists_ids;
+    // CPU-side data for building
+    std::vector<float> centroids;
+    std::vector<uint32_t> cluster_offsets;  // nlist + 1, offsets into data buffer
+    std::vector<std::vector<float>> invlists_data;  // Temporary storage during building
+    std::vector<std::vector<uint64_t>> invlists_ids;
+    std::vector<uint64_t> flat_ids;  // Cached: IDs in cluster-major order
 
-    // ID mapping for external IDs
-    std::vector<VectorId> id_mapping;
+    // GPU buffers
+    Buffer centroids_buffer;      // nlist * dimension fp32
+    Buffer data_buffer;           // vectors in cluster-major fp16
+    Buffer offsets_buffer;        // nlist + 1 uint32
+    Buffer ids_buffer;            // vector IDs uint64
+
+    // Search buffers
+    Buffer query_buffer;          // dimension fp16
+    Buffer selected_clusters_buf; // nprobe uint32
+    Buffer result_dists_buffer;   // k floats
+    Buffer result_idxs_buffer;    // k uints
+
+    // Pipeline
+    Pipeline search_pipeline;
+    DescriptorSet search_desc_set;
+    CommandBuffer search_cmd;
+    bool search_cmd_valid = false;
+    uint32_t search_cmd_k = 0;
+    uint32_t search_cmd_nprobe = 0;
+
+    // Assign pipeline
+    Pipeline assign_pipeline;
+    DescriptorSet assign_desc_set;
+
+    // Assign buffers (reused across add() calls)
+    Buffer assign_vectors_buf;    // input vectors (fp16)
+    Buffer assign_output_buf;     // cluster assignments (uint32)
 
     bool is_trained = false;
+    bool gpu_dirty = true;  // Need to rebuild GPU buffers
 };
 
-IndexIVFFlat::IndexIVFFlat(IndexIVFFlat&& other) noexcept
-    : impl_(std::move(other.impl_)) {}
-
-IndexIVFFlat& IndexIVFFlat::operator=(IndexIVFFlat&& other) noexcept {
-    impl_ = std::move(other.impl_);
-    return *this;
-}
-
+IndexIVFFlat::IndexIVFFlat(IndexIVFFlat&& other) noexcept : impl_(std::move(other.impl_)) {}
+IndexIVFFlat& IndexIVFFlat::operator=(IndexIVFFlat&& other) noexcept { impl_ = std::move(other.impl_); return *this; }
 IndexIVFFlat::~IndexIVFFlat() = default;
 
-Expected<IndexIVFFlat> IndexIVFFlat::create(
-    Context& ctx, uint32_t dimension,
-    const IVFParams& params, const IndexOptions& options) {
-
+Expected<IndexIVFFlat> IndexIVFFlat::create(Context& ctx, uint32_t dimension, const IVFParams& params, const IndexOptions& options) {
     IndexIVFFlat index;
     index.impl_ = std::make_unique<Impl>();
     index.impl_->ctx = &ctx;
@@ -191,38 +213,81 @@ Expected<IndexIVFFlat> IndexIVFFlat::create(
     index.impl_->use_fp16 = options.use_fp16;
     index.impl_->params = params;
 
-    // Pre-allocate inverted lists
     index.impl_->invlists_data.resize(params.nlist);
     index.impl_->invlists_ids.resize(params.nlist);
+    index.impl_->cluster_offsets.resize(params.nlist + 1, 0);
+
+    // Initialize pipeline
+    auto pipeline_result = index.init_pipelines();
+    if (!pipeline_result) {
+        return make_unexpected(pipeline_result.error().code(), pipeline_result.error().message());
+    }
 
     return index;
 }
 
-uint32_t IndexIVFFlat::dimension() const {
-    return impl_ ? impl_->dimension : 0;
-}
+Expected<void> IndexIVFFlat::init_pipelines() {
+    // Search pipeline
+    {
+        PipelineDesc desc;
+        desc.shader_name = "ivf_distance";
+        desc.bindings = {
+            {0, DescriptorBinding::StorageBuffer},  // centroids
+            {1, DescriptorBinding::StorageBuffer},  // cluster_offsets
+            {2, DescriptorBinding::StorageBuffer},  // data
+            {3, DescriptorBinding::StorageBuffer},  // query
+            {4, DescriptorBinding::StorageBuffer},  // selected_clusters
+            {5, DescriptorBinding::StorageBuffer},  // out_distances
+            {6, DescriptorBinding::StorageBuffer},  // out_indices
+        };
+        desc.push_constant_size = 20;  // n_clusters, dimension, k, nprobe, metric
 
-uint64_t IndexIVFFlat::size() const {
-    return impl_ ? impl_->n_vectors : 0;
-}
+        auto result = Pipeline::create(*impl_->ctx, desc);
+        if (!result) {
+            return make_unexpected(result.error().code(), "Failed to create IVF search pipeline: " + result.error().message());
+        }
+        impl_->search_pipeline = std::move(*result);
 
-bool IndexIVFFlat::is_trained() const {
-    return impl_ ? impl_->is_trained : false;
-}
-
-uint32_t IndexIVFFlat::nlist() const {
-    return impl_ ? impl_->actual_nlist : 0;
-}
-
-uint32_t IndexIVFFlat::nprobe() const {
-    return impl_ ? impl_->params.nprobe : 0;
-}
-
-void IndexIVFFlat::set_nprobe(uint32_t nprobe) {
-    if (impl_) {
-        impl_->params.nprobe = std::min(nprobe, impl_->actual_nlist);
+        auto desc_result = DescriptorSet::create(*impl_->ctx, impl_->search_pipeline);
+        if (!desc_result) {
+            return make_unexpected(desc_result.error().code(), "Failed to create IVF descriptor set");
+        }
+        impl_->search_desc_set = std::move(*desc_result);
     }
+
+    // Assign pipeline
+    {
+        PipelineDesc desc;
+        desc.shader_name = "assign_clusters";
+        desc.bindings = {
+            {0, DescriptorBinding::StorageBuffer},  // centroids
+            {1, DescriptorBinding::StorageBuffer},  // vectors
+            {2, DescriptorBinding::StorageBuffer},  // cluster_ids output
+        };
+        desc.push_constant_size = 20;  // n_clusters, dimension, n_vectors, metric, padding
+
+        auto result = Pipeline::create(*impl_->ctx, desc);
+        if (!result) {
+            return make_unexpected(result.error().code(), "Failed to create assign pipeline: " + result.error().message());
+        }
+        impl_->assign_pipeline = std::move(*result);
+
+        auto desc_result = DescriptorSet::create(*impl_->ctx, impl_->assign_pipeline);
+        if (!desc_result) {
+            return make_unexpected(desc_result.error().code(), "Failed to create assign descriptor set");
+        }
+        impl_->assign_desc_set = std::move(*desc_result);
+    }
+
+    return {};
 }
+
+uint32_t IndexIVFFlat::dimension() const { return impl_ ? impl_->dimension : 0; }
+uint64_t IndexIVFFlat::size() const { return impl_ ? impl_->n_vectors : 0; }
+bool IndexIVFFlat::is_trained() const { return impl_ ? impl_->is_trained : false; }
+uint32_t IndexIVFFlat::nlist() const { return impl_ ? impl_->actual_nlist : 0; }
+uint32_t IndexIVFFlat::nprobe() const { return impl_ ? impl_->params.nprobe : 0; }
+void IndexIVFFlat::set_nprobe(uint32_t nprobe) { if (impl_) impl_->params.nprobe = std::min(nprobe, impl_->actual_nlist); }
 
 IndexStats IndexIVFFlat::stats() const {
     IndexStats s{};
@@ -230,201 +295,387 @@ IndexStats IndexIVFFlat::stats() const {
         s.n_vectors = impl_->n_vectors;
         s.dimension = impl_->dimension;
         s.is_trained = impl_->is_trained;
+        s.gpu_memory_used = impl_->data_buffer.size() + impl_->centroids_buffer.size() + impl_->ids_buffer.size();
     }
     return s;
 }
 
 Expected<void> IndexIVFFlat::train(std::span<const float> data, uint64_t n) {
-    if (!impl_ || !impl_->ctx) {
-        return make_unexpected(ErrorCode::InvalidParameter, "Index not initialized");
-    }
+    if (!impl_ || !impl_->ctx) return make_unexpected(ErrorCode::InvalidParameter, "Index not initialized");
 
     uint64_t expected_size = n * impl_->dimension;
-    if (data.size() < expected_size) {
-        return make_unexpected(ErrorCode::InvalidParameter, "Data size mismatch");
-    }
+    if (data.size() < expected_size) return make_unexpected(ErrorCode::InvalidParameter, "Data size mismatch");
 
-    // Run K-means clustering
+    // Run K-means
     KMeans kmeans(impl_->params.nlist, impl_->dimension, impl_->params.kmeans_iters, impl_->metric);
     impl_->centroids = kmeans.fit(data.data(), n);
     impl_->actual_nlist = kmeans.nclusters();
-
-    // Ensure nprobe doesn't exceed actual_nlist
     impl_->params.nprobe = std::min(impl_->params.nprobe, impl_->actual_nlist);
+
+    // Upload centroids to GPU
+    uint64_t centroids_size = impl_->actual_nlist * impl_->dimension * sizeof(float);
+    if (!impl_->centroids_buffer.valid() || impl_->centroids_buffer.size() < centroids_size) {
+        BufferDesc desc = {};
+        desc.size = centroids_size;
+        desc.usage = BufferUsage::Storage | BufferUsage::TransferDst;
+        desc.memory_type = MemoryType::DeviceLocal;
+
+        auto buf = Buffer::create(*impl_->ctx, desc);
+        if (!buf) return make_unexpected(buf.error().code(), "Failed to create centroids buffer");
+        impl_->centroids_buffer = std::move(*buf);
+    }
+
+    std::vector<uint8_t> centroid_bytes(centroids_size);
+    std::memcpy(centroid_bytes.data(), impl_->centroids.data(), centroids_size);
+    auto upload_result = impl_->centroids_buffer.upload(centroid_bytes);
+    if (!upload_result) return upload_result;
+
+    // Update cluster offsets buffer
+    impl_->cluster_offsets.resize(impl_->actual_nlist + 1, 0);
 
     impl_->is_trained = true;
     return {};
 }
 
-Expected<void> IndexIVFFlat::add(std::span<const float> data, uint64_t n,
-                                  std::span<const VectorId> ids) {
-    if (!impl_ || !impl_->ctx) {
-        return make_unexpected(ErrorCode::InvalidParameter, "Index not initialized");
-    }
-
-    if (!impl_->is_trained) {
-        return make_unexpected(ErrorCode::InvalidParameter, "Index must be trained before adding vectors");
-    }
+Expected<void> IndexIVFFlat::add(std::span<const float> data, uint64_t n, std::span<const VectorId> ids) {
+    if (!impl_ || !impl_->ctx) return make_unexpected(ErrorCode::InvalidParameter, "Index not initialized");
+    if (!impl_->is_trained) return make_unexpected(ErrorCode::InvalidParameter, "Index must be trained first");
 
     uint64_t expected_size = n * impl_->dimension;
-    if (data.size() < expected_size) {
-        return make_unexpected(ErrorCode::InvalidParameter, "Data size mismatch");
+    if (data.size() < expected_size) return make_unexpected(ErrorCode::InvalidParameter, "Data size mismatch");
+
+    if (n == 0) return {};
+
+    // Allocate/reallocate GPU buffers for assignment
+    uint64_t vectors_size = n * impl_->dimension * sizeof(uint16_t);
+    if (!impl_->assign_vectors_buf.valid() || impl_->assign_vectors_buf.size() < vectors_size) {
+        BufferDesc desc = {};
+        desc.size = vectors_size;
+        desc.usage = BufferUsage::Storage | BufferUsage::TransferDst;
+        desc.memory_type = MemoryType::HostCoherent;
+        desc.map_on_create = true;
+
+        auto buf = Buffer::create(*impl_->ctx, desc);
+        if (!buf) return make_unexpected(buf.error().code(), "Failed to create assign vectors buffer");
+        impl_->assign_vectors_buf = std::move(*buf);
     }
 
-    // Assign each new vector to nearest centroid
+    uint64_t output_size = n * sizeof(uint32_t);
+    if (!impl_->assign_output_buf.valid() || impl_->assign_output_buf.size() < output_size) {
+        BufferDesc desc = {};
+        desc.size = output_size;
+        desc.usage = BufferUsage::Storage | BufferUsage::TransferSrc;
+        desc.memory_type = MemoryType::HostReadback;
+        desc.map_on_create = true;
+
+        auto buf = Buffer::create(*impl_->ctx, desc);
+        if (!buf) return make_unexpected(buf.error().code(), "Failed to create assign output buffer");
+        impl_->assign_output_buf = std::move(*buf);
+    }
+
+    // Convert and upload vectors to fp16
+    {
+        uint16_t* mapped = reinterpret_cast<uint16_t*>(impl_->assign_vectors_buf.mapped());
+        for (uint64_t i = 0; i < n * impl_->dimension; ++i) {
+            mapped[i] = float_to_half(data[i]);
+        }
+    }
+
+    // Bind descriptor set
+    auto bind0 = impl_->assign_desc_set.bind_buffer(0, impl_->centroids_buffer);
+    auto bind1 = impl_->assign_desc_set.bind_buffer(1, impl_->assign_vectors_buf);
+    auto bind2 = impl_->assign_desc_set.bind_buffer(2, impl_->assign_output_buf);
+
+    if (!bind0 || !bind1 || !bind2) {
+        return make_unexpected(ErrorCode::OperationFailed, "Failed to bind assign descriptor set");
+    }
+
+    // Create command buffer and dispatch
+    auto cmd_result = CommandBuffer::create(*impl_->ctx);
+    if (!cmd_result) return make_unexpected(cmd_result.error().code(), cmd_result.error().message());
+
+    CommandBuffer cmd = std::move(*cmd_result);
+
+    struct PushConstants {
+        uint32_t n_clusters;
+        uint32_t dimension;
+        uint32_t n_vectors;
+        uint32_t metric;
+        uint32_t padding;
+    } pc = {
+        impl_->actual_nlist,
+        impl_->dimension,
+        static_cast<uint32_t>(n),
+        (impl_->metric == Metric::IP) ? 1u : 0u,
+        0u
+    };
+
+    cmd.begin();
+    cmd.bind_pipeline(impl_->assign_pipeline);
+    cmd.bind_descriptor_set(impl_->assign_pipeline, impl_->assign_desc_set);
+    cmd.push_constants(impl_->assign_pipeline, &pc, sizeof(pc));
+    cmd.dispatch(static_cast<uint32_t>(n));  // One workgroup per vector
+    cmd.end();
+
+    auto submit_result = submit_and_wait(*impl_->ctx, cmd);
+    if (!submit_result) return make_unexpected(submit_result.error().code(), submit_result.error().message());
+
+    // Read back cluster assignments
+    const uint32_t* cluster_ids = reinterpret_cast<const uint32_t*>(impl_->assign_output_buf.mapped());
+
+    // Store vectors in appropriate inverted lists
     for (uint64_t i = 0; i < n; ++i) {
-        const float* vec = data.data() + i * impl_->dimension;
-
-        double min_dist = std::numeric_limits<double>::max();
-        uint32_t best_cluster = 0;
-
-        for (uint32_t c = 0; c < impl_->actual_nlist; ++c) {
-            double dist = 0.0;
-            if (impl_->metric == Metric::L2) {
-                for (uint32_t d = 0; d < impl_->dimension; ++d) {
-                    double diff = static_cast<double>(vec[d]) - static_cast<double>(impl_->centroids[c * impl_->dimension + d]);
-                    dist += diff * diff;
-                }
-            } else {
-                for (uint32_t d = 0; d < impl_->dimension; ++d) {
-                    dist += static_cast<double>(vec[d]) * static_cast<double>(impl_->centroids[c * impl_->dimension + d]);
-                }
-                dist = -dist;
-            }
-
-            if (dist < min_dist) {
-                min_dist = dist;
-                best_cluster = c;
-            }
+        uint32_t cluster = cluster_ids[i];
+        if (cluster >= impl_->actual_nlist) {
+            cluster = 0;  // Fallback to first cluster if invalid
         }
 
-        // Store vector data in cluster
-        impl_->invlists_data[best_cluster].insert(
-            impl_->invlists_data[best_cluster].end(),
-            vec,
-            vec + impl_->dimension
-        );
+        const float* vec = data.data() + i * impl_->dimension;
+        impl_->invlists_data[cluster].insert(impl_->invlists_data[cluster].end(), vec, vec + impl_->dimension);
 
-        // Store ID
         VectorId external_id = ids.empty() ? (impl_->n_vectors + i) : ids[i];
-        impl_->invlists_ids[best_cluster].push_back(external_id);
-        impl_->id_mapping.push_back(external_id);
+        impl_->invlists_ids[cluster].push_back(external_id);
     }
 
     impl_->n_vectors += n;
+    impl_->gpu_dirty = true;
+    return {};
+}
+
+Expected<void> IndexIVFFlat::upload_to_gpu() {
+    if (!impl_->gpu_dirty || impl_->n_vectors == 0) return {};
+
+    // Compute cluster offsets
+    impl_->cluster_offsets[0] = 0;
+    for (uint32_t c = 0; c < impl_->actual_nlist; ++c) {
+        impl_->cluster_offsets[c + 1] = impl_->cluster_offsets[c] + static_cast<uint32_t>(impl_->invlists_ids[c].size());
+    }
+
+    // Build cluster-major data buffer (fp16)
+    uint64_t data_size = impl_->n_vectors * impl_->dimension * sizeof(uint16_t);
+
+    if (!impl_->data_buffer.valid() || impl_->data_buffer.size() < data_size) {
+        BufferDesc desc = {};
+        desc.size = data_size;
+        desc.usage = BufferUsage::Storage | BufferUsage::TransferDst;
+        desc.memory_type = MemoryType::DeviceLocal;
+
+        auto buf = Buffer::create(*impl_->ctx, desc);
+        if (!buf) return make_unexpected(buf.error().code(), "Failed to create data buffer");
+        impl_->data_buffer = std::move(*buf);
+    }
+
+    // Flatten data in cluster-major order
+    std::vector<uint16_t> flat_data(impl_->n_vectors * impl_->dimension);
+    uint64_t offset = 0;
+    for (uint32_t c = 0; c < impl_->actual_nlist; ++c) {
+        for (size_t v = 0; v < impl_->invlists_data[c].size() / impl_->dimension; ++v) {
+            for (uint32_t d = 0; d < impl_->dimension; ++d) {
+                flat_data[offset++] = float_to_half(impl_->invlists_data[c][v * impl_->dimension + d]);
+            }
+        }
+    }
+
+    std::vector<uint8_t> data_bytes(flat_data.size() * sizeof(uint16_t));
+    std::memcpy(data_bytes.data(), flat_data.data(), data_bytes.size());
+    auto upload_data = impl_->data_buffer.upload(data_bytes);
+    if (!upload_data) return upload_data;
+
+    // Upload cluster offsets
+    uint64_t offsets_size = (impl_->actual_nlist + 1) * sizeof(uint32_t);
+    if (!impl_->offsets_buffer.valid() || impl_->offsets_buffer.size() < offsets_size) {
+        BufferDesc desc = {};
+        desc.size = offsets_size;
+        desc.usage = BufferUsage::Storage | BufferUsage::TransferDst;
+        desc.memory_type = MemoryType::DeviceLocal;
+
+        auto buf = Buffer::create(*impl_->ctx, desc);
+        if (!buf) return make_unexpected(buf.error().code(), "Failed to create offsets buffer");
+        impl_->offsets_buffer = std::move(*buf);
+    }
+
+    std::vector<uint8_t> offset_bytes(offsets_size);
+    std::memcpy(offset_bytes.data(), impl_->cluster_offsets.data(), offsets_size);
+    auto upload_offsets = impl_->offsets_buffer.upload(offset_bytes);
+    if (!upload_offsets) return upload_offsets;
+
+    // Upload IDs in cluster-major order
+    uint64_t ids_size = impl_->n_vectors * sizeof(uint64_t);
+    if (!impl_->ids_buffer.valid() || impl_->ids_buffer.size() < ids_size) {
+        BufferDesc desc = {};
+        desc.size = ids_size;
+        desc.usage = BufferUsage::Storage | BufferUsage::TransferDst;
+        desc.memory_type = MemoryType::DeviceLocal;
+
+        auto buf = Buffer::create(*impl_->ctx, desc);
+        if (!buf) return make_unexpected(buf.error().code(), "Failed to create IDs buffer");
+        impl_->ids_buffer = std::move(*buf);
+    }
+
+    // Build and cache flat_ids in cluster-major order
+    impl_->flat_ids.resize(impl_->n_vectors);
+    uint64_t id_offset = 0;
+    for (uint32_t c = 0; c < impl_->actual_nlist; ++c) {
+        for (uint64_t id : impl_->invlists_ids[c]) {
+            impl_->flat_ids[id_offset++] = id;
+        }
+    }
+
+    std::vector<uint8_t> id_bytes(ids_size);
+    std::memcpy(id_bytes.data(), impl_->flat_ids.data(), ids_size);
+    auto upload_ids = impl_->ids_buffer.upload(id_bytes);
+    if (!upload_ids) return upload_ids;
+
+    impl_->gpu_dirty = false;
+    impl_->search_cmd_valid = false;
     return {};
 }
 
 Expected<SearchResults> IndexIVFFlat::search(Vector query, uint32_t k) {
-    if (!impl_ || !impl_->ctx) {
-        return make_unexpected(ErrorCode::InvalidParameter, "Index not initialized");
-    }
+    if (!impl_ || !impl_->ctx) return make_unexpected(ErrorCode::InvalidParameter, "Index not initialized");
+    if (query.size() != impl_->dimension) return make_unexpected(ErrorCode::InvalidDimension, "Query dimension mismatch");
+    if (impl_->n_vectors == 0) return SearchResults(1, k);
 
-    if (query.size() != impl_->dimension) {
-        return make_unexpected(ErrorCode::InvalidDimension, "Query dimension mismatch");
-    }
+    // Upload data to GPU if dirty
+    auto upload_result = upload_to_gpu();
+    if (!upload_result) return make_unexpected(upload_result.error().code(), upload_result.error().message());
 
-    if (impl_->n_vectors == 0) {
-        return SearchResults(1, k);
-    }
-
-    // Find nprobe nearest centroids
-    std::vector<std::pair<float, uint32_t>> centroid_distances;
-    centroid_distances.reserve(impl_->actual_nlist);
-
-    for (uint32_t c = 0; c < impl_->actual_nlist; ++c) {
-        float dist = 0.0f;
-        if (impl_->metric == Metric::L2) {
-            for (uint32_t d = 0; d < impl_->dimension; ++d) {
-                float diff = query[d] - impl_->centroids[c * impl_->dimension + d];
-                dist += diff * diff;
-            }
-        } else {
-            for (uint32_t d = 0; d < impl_->dimension; ++d) {
-                dist += query[d] * impl_->centroids[c * impl_->dimension + d];
-            }
-            dist = -dist;
-        }
-        centroid_distances.emplace_back(dist, c);
-    }
-
-    // Sort by distance and take nprobe closest
     uint32_t nprobe = std::min(impl_->params.nprobe, impl_->actual_nlist);
-    std::partial_sort(centroid_distances.begin(), centroid_distances.begin() + nprobe,
-                      centroid_distances.end());
 
-    // Collect candidates from selected clusters
-    std::vector<std::pair<float, VectorId>> candidates;
+    // Upload query to GPU (fp16)
+    if (!impl_->query_buffer.valid() || impl_->query_buffer.size() < impl_->dimension * sizeof(uint16_t)) {
+        BufferDesc desc = {};
+        desc.size = impl_->dimension * sizeof(uint16_t);
+        desc.usage = BufferUsage::Storage | BufferUsage::TransferDst;
+        desc.memory_type = MemoryType::HostCoherent;
+        desc.map_on_create = true;
 
-    for (uint32_t p = 0; p < nprobe; ++p) {
-        uint32_t cluster = centroid_distances[p].second;
+        auto buf = Buffer::create(*impl_->ctx, desc);
+        if (!buf) return make_unexpected(buf.error().code(), "Failed to create query buffer");
+        impl_->query_buffer = std::move(*buf);
+    }
 
-        const auto& cluster_data = impl_->invlists_data[cluster];
-        const auto& cluster_ids = impl_->invlists_ids[cluster];
-        uint32_t cluster_size = static_cast<uint32_t>(cluster_ids.size());
-
-        for (uint32_t v = 0; v < cluster_size; ++v) {
-            const float* vec = cluster_data.data() + v * impl_->dimension;
-
-            float dist = 0.0f;
-            if (impl_->metric == Metric::L2) {
-                for (uint32_t d = 0; d < impl_->dimension; ++d) {
-                    float diff = query[d] - vec[d];
-                    dist += diff * diff;
-                }
-            } else {
-                for (uint32_t d = 0; d < impl_->dimension; ++d) {
-                    dist += query[d] * vec[d];
-                }
-                dist = -dist;
-            }
-
-            candidates.emplace_back(dist, cluster_ids[v]);
+    {
+        uint16_t* mapped = reinterpret_cast<uint16_t*>(impl_->query_buffer.mapped());
+        for (uint32_t d = 0; d < impl_->dimension; ++d) {
+            mapped[d] = float_to_half(query[d]);
         }
     }
 
-    // Sort candidates and take top-k
+    // Allocate selected clusters buffer (shader writes to it)
+    if (!impl_->selected_clusters_buf.valid() || impl_->selected_clusters_buf.size() < impl_->params.nlist * sizeof(uint32_t)) {
+        BufferDesc desc = {};
+        desc.size = impl_->params.nlist * sizeof(uint32_t);
+        desc.usage = BufferUsage::Storage;
+        desc.memory_type = MemoryType::DeviceLocal;
+
+        auto buf = Buffer::create(*impl_->ctx, desc);
+        if (!buf) return make_unexpected(buf.error().code(), "Failed to create selected clusters buffer");
+        impl_->selected_clusters_buf = std::move(*buf);
+    }
+
+    // Allocate result buffers
+    uint64_t result_size = k * sizeof(float);
+    if (!impl_->result_dists_buffer.valid() || impl_->result_dists_buffer.size() < result_size) {
+        BufferDesc desc = {};
+        desc.size = result_size;
+        desc.usage = BufferUsage::Storage | BufferUsage::TransferSrc;
+        desc.memory_type = MemoryType::HostReadback;
+        desc.map_on_create = true;
+
+        auto buf = Buffer::create(*impl_->ctx, desc);
+        if (!buf) return make_unexpected(buf.error().code(), "Failed to create result distances buffer");
+        impl_->result_dists_buffer = std::move(*buf);
+
+        buf = Buffer::create(*impl_->ctx, desc);
+        if (!buf) return make_unexpected(buf.error().code(), "Failed to create result indices buffer");
+        impl_->result_idxs_buffer = std::move(*buf);
+    }
+
+    // Bind descriptor set
+    auto bind0 = impl_->search_desc_set.bind_buffer(0, impl_->centroids_buffer);
+    auto bind1 = impl_->search_desc_set.bind_buffer(1, impl_->offsets_buffer);
+    auto bind2 = impl_->search_desc_set.bind_buffer(2, impl_->data_buffer);
+    auto bind3 = impl_->search_desc_set.bind_buffer(3, impl_->query_buffer);
+    auto bind4 = impl_->search_desc_set.bind_buffer(4, impl_->selected_clusters_buf);
+    auto bind5 = impl_->search_desc_set.bind_buffer(5, impl_->result_dists_buffer);
+    auto bind6 = impl_->search_desc_set.bind_buffer(6, impl_->result_idxs_buffer);
+
+    if (!bind0 || !bind1 || !bind2 || !bind3 || !bind4 || !bind5 || !bind6) {
+        return make_unexpected(ErrorCode::OperationFailed, "Failed to bind descriptor set");
+    }
+
+    // Record or reuse command buffer
+    bool need_rerecord = !impl_->search_cmd_valid || impl_->search_cmd_k != k || impl_->search_cmd_nprobe != nprobe;
+
+    if (need_rerecord) {
+        if (!impl_->search_cmd.valid()) {
+            auto cmd_result = CommandBuffer::create(*impl_->ctx);
+            if (!cmd_result) return make_unexpected(cmd_result.error().code(), cmd_result.error().message());
+            impl_->search_cmd = std::move(*cmd_result);
+        } else {
+            impl_->search_cmd.reset();
+        }
+
+        struct PushConstants {
+            uint32_t n_clusters;
+            uint32_t dimension;
+            uint32_t k;
+            uint32_t nprobe;
+            uint32_t metric;
+        } pc = {
+            impl_->actual_nlist,
+            impl_->dimension,
+            k,
+            nprobe,
+            (impl_->metric == Metric::IP) ? 1u : 0u
+        };
+
+        impl_->search_cmd.begin();
+        impl_->search_cmd.bind_pipeline(impl_->search_pipeline);
+        impl_->search_cmd.bind_descriptor_set(impl_->search_pipeline, impl_->search_desc_set);
+        impl_->search_cmd.push_constants(impl_->search_pipeline, &pc, sizeof(pc));
+        impl_->search_cmd.dispatch(1);  // Single workgroup
+        impl_->search_cmd.end();
+
+        impl_->search_cmd_valid = true;
+        impl_->search_cmd_k = k;
+        impl_->search_cmd_nprobe = nprobe;
+    }
+
+    // Submit and wait
+    auto submit_result = submit_and_wait(*impl_->ctx, impl_->search_cmd);
+    if (!submit_result) return make_unexpected(submit_result.error().code(), submit_result.error().message());
+
+    // Read results
+    const float* dists = reinterpret_cast<const float*>(impl_->result_dists_buffer.mapped());
+    const uint32_t* idxs = reinterpret_cast<const uint32_t*>(impl_->result_idxs_buffer.mapped());
+
+    // Map buffer indices to external IDs using cached flat_ids
     SearchResults results(1, k);
-    uint32_t actual_k = std::min(k, static_cast<uint32_t>(candidates.size()));
-
-    if (actual_k > 0) {
-        std::partial_sort(candidates.begin(), candidates.begin() + actual_k, candidates.end(),
-            [](const auto& a, const auto& b) { return a.first < b.first; });
-
-        for (uint32_t i = 0; i < actual_k; ++i) {
-            results.results[i].distance = candidates[i].first;
-            results.results[i].id = candidates[i].second;
+    for (uint32_t i = 0; i < k; ++i) {
+        if (idxs[i] != 0xFFFFFFFFu && idxs[i] < impl_->n_vectors) {
+            results.results[i].distance = dists[i];
+            results.results[i].id = impl_->flat_ids[idxs[i]];
         }
     }
 
     return results;
 }
 
-Expected<SearchResults> IndexIVFFlat::search(std::span<const float> queries,
-                                              uint64_t n_queries, uint32_t k) {
-    if (!impl_ || !impl_->ctx) {
-        return make_unexpected(ErrorCode::InvalidParameter, "Index not initialized");
-    }
-
-    if (impl_->n_vectors == 0) {
-        return SearchResults(n_queries, k);
-    }
+Expected<SearchResults> IndexIVFFlat::search(std::span<const float> queries, uint64_t n_queries, uint32_t k) {
+    if (!impl_ || !impl_->ctx) return make_unexpected(ErrorCode::InvalidParameter, "Index not initialized");
+    if (impl_->n_vectors == 0) return SearchResults(n_queries, k);
 
     SearchResults results(n_queries, k);
-
     for (uint64_t q = 0; q < n_queries; ++q) {
-        std::vector<float> query(queries.begin() + q * impl_->dimension,
-                                  queries.begin() + (q + 1) * impl_->dimension);
-        auto single_result = search(query, k);
-        if (!single_result) {
-            return single_result;
-        }
-
+        std::vector<float> query(queries.begin() + q * impl_->dimension, queries.begin() + (q + 1) * impl_->dimension);
+        auto single = search(query, k);
+        if (!single) return single;
         for (uint32_t i = 0; i < k; ++i) {
-            results.results[q * k + i] = single_result->results[i];
+            results.results[q * k + i] = single->results[i];
         }
     }
-
     return results;
 }
 
@@ -441,13 +692,11 @@ Expected<void> IndexIVFFlat::load(const std::filesystem::path& path) {
 void IndexIVFFlat::reset() {
     if (impl_) {
         impl_->n_vectors = 0;
-        impl_->id_mapping.clear();
-        for (auto& list : impl_->invlists_data) {
-            list.clear();
-        }
-        for (auto& list : impl_->invlists_ids) {
-            list.clear();
-        }
+        impl_->gpu_dirty = true;
+        impl_->search_cmd_valid = false;
+        for (auto& list : impl_->invlists_data) list.clear();
+        for (auto& list : impl_->invlists_ids) list.clear();
+        std::fill(impl_->cluster_offsets.begin(), impl_->cluster_offsets.end(), 0);
     }
 }
 

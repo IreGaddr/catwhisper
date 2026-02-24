@@ -53,6 +53,7 @@ private:
     std::unique_ptr<Impl> impl_;
 
     Expected<void> init_pipelines();
+    Expected<void> upload_to_gpu();
 };
 
 } // namespace cw

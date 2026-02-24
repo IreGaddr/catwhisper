@@ -15,6 +15,8 @@ set(SHADER_SOURCES
     distance_topk_batch.comp
     transpose_add.comp
     soa_repack.comp
+    ivf_distance.comp
+    assign_clusters.comp
 )
 
 set(SHADER_OUTPUTS "")

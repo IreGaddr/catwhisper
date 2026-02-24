@@ -2,110 +2,90 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_KHR_shader_subgroup_basic : require
 
-// Assign each query vector to its nearest centroid(s)
-// Returns the nprobe nearest centroid indices for each query
+// Assign each vector to its nearest cluster
+// One workgroup per vector
 
 layout(local_size_x = 256) in;
 
 layout(binding = 0) buffer CentroidsBuffer {
-    float centroids[];  // n_centroids * dimension
+    float centroids[];  // n_clusters * dimension
 };
 
-layout(binding = 1) buffer QueriesBuffer {
-    float queries[];    // n_queries * dimension
+layout(binding = 1) buffer VectorsBuffer {
+    float16_t vectors[];  // n_vectors * dimension (fp16)
 };
 
 layout(binding = 2) buffer OutputBuffer {
-    uint nearest_clusters[];  // n_queries * nprobe (top-nprobe centroids per query)
+    uint cluster_ids[];  // n_vectors (single best cluster per vector)
 };
 
 layout(push_constant) uniform PushConstants {
-    uint n_centroids;
+    uint n_clusters;
     uint dimension;
-    uint n_queries;
-    uint nprobe;
+    uint n_vectors;
     uint metric;  // 0 = L2, 1 = IP
 } pc;
 
-shared float shared_query[128];  // Shared query vector for workgroup
+shared float16_t shared_vec[128];
+shared float shared_dists[256];
+shared uint shared_cluster_ids[256];
 
 void main() {
-    uint query_idx = gl_WorkGroupID.x;
+    uint vec_idx = gl_WorkGroupID.x;
     uint local_id = gl_LocalInvocationID.x;
+    uint wg_size = gl_WorkGroupSize.x;
 
-    if (query_idx >= pc.n_queries) return;
+    if (vec_idx >= pc.n_vectors) return;
 
-    // Load query vector into shared memory
-    for (uint d = local_id; d < pc.dimension; d += gl_WorkGroupSize.x) {
-        shared_query[d] = queries[query_idx * pc.dimension + d];
+    // Load vector into shared memory
+    for (uint d = local_id; d < pc.dimension; d += wg_size) {
+        shared_vec[d] = vectors[vec_idx * pc.dimension + d];
     }
     barrier();
 
-    // Each thread computes distance to a subset of centroids
-    // Use heap to track top-nprobe centroids
+    // Each thread finds best among its assigned centroids
+    float best_dist = 1e30f;
+    uint best_cluster = 0u;
 
-    // Simple approach: each thread computes all distances, we use reduction
-    // For now, naive approach - each thread handles its centroids
-
-    // Max distances heap (for L2 we want minimum, for IP we want maximum)
-    float best_dists[32];  // Max nprobe
-    uint best_ids[32];
-
-    for (uint i = 0; i < pc.nprobe; ++i) {
-        best_dists[i] = 1e30f;
-        best_ids[i] = 0xFFFFFFFFu;
-    }
-
-    // Iterate over centroids assigned to this thread
-    for (uint c = local_id; c < pc.n_centroids; c += gl_WorkGroupSize.x) {
+    for (uint c = local_id; c < pc.n_clusters; c += wg_size) {
         float dist = 0.0f;
 
         if (pc.metric == 0u) {
             // L2 distance
-            for (uint d = 0; d < pc.dimension; ++d) {
-                float diff = shared_query[d] - centroids[c * pc.dimension + d];
+            for (uint d = 0u; d < pc.dimension; ++d) {
+                float diff = float(shared_vec[d]) - centroids[c * pc.dimension + d];
                 dist += diff * diff;
             }
         } else {
-            // Inner product (negated for min-heap compatibility)
-            for (uint d = 0; d < pc.dimension; ++d) {
-                dist += shared_query[d] * centroids[c * pc.dimension + d];
+            // Inner product (negated for min-finding)
+            for (uint d = 0u; d < pc.dimension; ++d) {
+                dist += float(shared_vec[d]) * centroids[c * pc.dimension + d];
             }
             dist = -dist;
         }
 
-        // Insert into heap if better than worst
-        if (dist < best_dists[pc.nprobe - 1u]) {
-            best_dists[pc.nprobe - 1u] = dist;
-            best_ids[pc.nprobe - 1u] = c;
-
-            // Bubble up
-            uint idx = pc.nprobe - 1u;
-            while (idx > 0u && best_dists[idx] < best_dists[idx - 1u]) {
-                float tmp_dist = best_dists[idx];
-                best_dists[idx] = best_dists[idx - 1u];
-                best_dists[idx - 1u] = tmp_dist;
-
-                uint tmp_id = best_ids[idx];
-                best_ids[idx] = best_ids[idx - 1u];
-                best_ids[idx - 1u] = tmp_id;
-
-                --idx;
-            }
+        if (dist < best_dist) {
+            best_dist = dist;
+            best_cluster = c;
         }
     }
 
-    // Now we need to merge results across threads in workgroup
-    // For simplicity, use subgroup operations
-    // Each thread's local heap gets merged into workgroup result
+    shared_dists[local_id] = best_dist;
+    shared_cluster_ids[local_id] = best_cluster;
+    barrier();
 
-    // Store thread-local best in global memory temporarily for reduction
-    // This is simplified - a proper implementation would use parallel reduction
-
-    // For now, thread 0 writes its results (will be improved)
+    // Reduce: thread 0 finds global best
     if (local_id == 0u) {
-        for (uint i = 0; i < pc.nprobe; ++i) {
-            nearest_clusters[query_idx * pc.nprobe + i] = best_ids[i];
+        float global_best = 1e30f;
+        uint global_best_cluster = 0u;
+
+        for (uint i = 0u; i < wg_size; ++i) {
+            if (shared_dists[i] < global_best) {
+                global_best = shared_dists[i];
+                global_best_cluster = shared_cluster_ids[i];
+            }
         }
+
+        cluster_ids[vec_idx] = global_best_cluster;
     }
 }

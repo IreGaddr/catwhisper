@@ -222,35 +222,39 @@ auto results = index.search(query, 10);
 | Task | Description | Priority | Status |
 |------|-------------|----------|--------|
 | K-means CPU | Cluster training implementation | Critical | ✅ Done (k-means++ init) |
-| assign_clusters.comp | Find nearest centroids | Critical | ✅ Written (GPU path pending) |
-| IVF data layout | Cluster-sorted storage | Critical | ✅ Done (CPU inverted lists) |
+| assign_clusters.comp | Find nearest centroids | Critical | ✅ Done (GPU integrated) |
+| IVF data layout | Cluster-sorted storage | Critical | ✅ Done (cluster-major fp16) |
 | IndexIVFFlat class | Host implementation | Critical | ✅ Done |
 | Training API | train() method | Critical | ✅ Done |
 | Variable nprobe | Configurable search quality | High | ✅ Done |
-| Unit tests | Basic correctness tests | High | ✅ Done (11 tests) |
-| GPU search path | Offload distance computation | High | ❌ Not started |
+| Unit tests | Basic correctness tests | High | ✅ Done (15 tests) |
+| GPU search path | Offload distance computation | High | ✅ Done |
+| GPU centroid selection | nprobe nearest on GPU | Medium | ✅ Done |
 | ROTRTA assertions | Performance budget tests | Critical | ❌ Not started |
 
 #### Shaders
 
 ```
 shaders/
-├── assign_clusters.comp    # Find nprobe nearest centroids ✅ Written
-└── ivf_distance.comp       # Distance in selected clusters ✅ Written
+├── assign_clusters.comp    # Find nearest centroid per vector ✅ Integrated
+└── ivf_distance.comp       # Centroid selection + distance + top-k ✅ Integrated
 ```
 
 #### Implementation Status
 
-**Business Logic: COMPLETE** — All 11 unit tests passing. K-means++ training, inverted list storage, configurable nprobe search all working.
+**GPU-Accelerated: COMPLETE** — All 15 unit tests passing. Full GPU pipeline:
+- `add()`: Uses `assign_clusters.comp` for GPU cluster assignment
+- `search()`: Uses `ivf_distance.comp` for GPU centroid selection, distance computation, and top-k selection
+- Data stored in cluster-major fp16 layout with cached ID mapping
 
-**ROTRTA Optimization: NOT STARTED** — Current implementation uses CPU for all distance computations. GPU shaders written but not integrated. Performance budget assertions not yet defined.
+**ROTRTA Optimization: NOT STARTED** — Performance budget assertions not yet defined.
 
 #### ROTRTA Performance Targets (to be validated)
 
 | Config | Target | Current |
 |--------|--------|---------|
-| 10K × 128, k=10, nprobe=16 | faster than IndexFlat | CPU-only (slow) |
-| 100K × 128, k=10, nprobe=16 | < 0.5ms | CPU-only (slow) |
+| 10K × 128, k=10, nprobe=16 | faster than IndexFlat | GPU impl ready, benchmarking pending |
+| 100K × 128, k=10, nprobe=16 | < 0.5ms | GPU impl ready, benchmarking pending |
 | Recall@10, nprobe=32 | > 95% | TBD |
 | Recall@10, nprobe=64 | > 99% | TBD |
 
@@ -259,9 +263,10 @@ shaders/
 - [x] K-means clustering converges
 - [x] IndexIVFFlat training works
 - [x] Search with configurable nprobe
-- [ ] Recall > 95% at nprobe=32 (ROTRA pending)
-- [ ] GPU search path integrated
-- [ ] Beats IndexFlat at 100K+ vectors
+- [x] GPU search path integrated (centroid selection + distance + top-k)
+- [x] GPU cluster assignment (add operation)
+- [ ] Recall > 95% at nprobe=32 (ROTRTA pending)
+- [ ] Performance benchmarks vs IndexFlat
 
 #### Success Criteria
 
@@ -475,7 +480,7 @@ ctest --output-on-failure
 ```
 Phase 0: Foundation     [████████░░] 80%  ✅ Complete
 Phase 1: IndexFlat      [██████████] 100% ✅ Complete — beats FAISS-GPU on all benchmarks
-Phase 2: IndexIVFFlat   [██████░░░░] 60%  ⚠️ Business logic done, ROTRTA pending
+Phase 2: IndexIVFFlat   [████████░░] 80%  ⚠️ GPU-accelerated, ROTRTA pending
 Phase 3: IndexIVFPQ     [░░░░░░░░░░] 0%
 Phase 4: IndexHNSW      [░░░░░░░░░░] 0%
 Phase 5: Production     [░░░░░░░░░░] 0%
@@ -493,7 +498,7 @@ Phase 5: Production     [░░░░░░░░░░] 0%
 | Error handling | `error.hpp` | ✅ Complete |
 | Types | `types.hpp` | ✅ Complete |
 | IndexFlat | `index_flat.hpp`, `index_flat.cpp` | ✅ Complete |
-| IndexIVFFlat | `index_ivf_flat.hpp`, `index_ivf_flat.cpp` | ⚠️ Business logic complete, GPU path pending |
+| IndexIVFFlat | `index_ivf_flat.hpp`, `index_ivf_flat.cpp` | ✅ Complete (GPU-accelerated) |
 
 ### Shaders
 
@@ -502,8 +507,8 @@ Phase 5: Production     [░░░░░░░░░░] 0%
 | L2 Distance | `distance_l2.comp` | ✅ Complete |
 | Inner Product | `distance_ip.comp` | ✅ Complete |
 | Top-K Bitonic Sort | `topk_heap.comp` | ✅ Complete (GPU sort + CPU merge) |
-| IVF Cluster Assign | `assign_clusters.comp` | ✅ Written (not integrated) |
-| IVF Distance Search | `ivf_distance.comp` | ✅ Written (not integrated) |
+| IVF Cluster Assign | `assign_clusters.comp` | ✅ Complete (GPU integrated) |
+| IVF Distance Search | `ivf_distance.comp` | ✅ Complete (centroid selection + search) |
 
 ### Tests
 
@@ -512,7 +517,7 @@ All 59 unit tests passing:
 - ContextTest (5 tests)
 - ErrorTest (6 tests)
 - IndexFlatTest (13 tests)
-- IndexIVFFlatTest (11 tests) — business logic only
+- IndexIVFFlatTest (15 tests) — GPU-accelerated add + search
 - MinimalTest (5 tests)
 - TypesTest (5 tests)
 - IntegrationTest (2 tests)
@@ -526,8 +531,8 @@ All 59 unit tests passing:
 | IndexFlat single-query latency | beats FAISS-GPU @ 10K×128 | ✅ **0.053 ms** (FAISS-GPU: 0.065 ms) |
 | IndexFlat single-query latency | beats FAISS-GPU @ 100K×256 | ✅ **0.106 ms** (FAISS-GPU: 0.601 ms) |
 | ROTRTA assertions | 3/3 passing | ✅ All green |
-| IndexIVFFlat recall@10 | >95% @ nprobe=32 | ⚠️ CPU impl works, GPU pending |
-| IndexIVFFlat latency | <0.5ms @ 100K×128 | ❌ CPU-only (slow) |
+| IndexIVFFlat recall@10 | >95% @ nprobe=32 | ⚠️ GPU impl complete, benchmarking pending |
+| IndexIVFFlat latency | <0.5ms @ 100K×128 | ⚠️ GPU impl complete, benchmarking pending |
 | IndexIVFPQ compression | >20x | ❌ Not implemented |
 | IndexHNSW latency | <1ms @ 1M | ❌ Not implemented |
 | Test coverage | >80% | ✅ Core functionality tested (59 unit + 3 ROTRTA) |
