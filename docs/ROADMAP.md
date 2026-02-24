@@ -59,7 +59,7 @@ std::cout << ctx.device_info().name << std::endl;
 | Data upload | Host → GPU staging and transfer | Critical | ✅ Done |
 | Result download | GPU → Host readback | Critical | ✅ Done |
 | Unit tests | IndexFlat test coverage | High | ✅ Done (41 tests) |
-| Benchmarks | vs FAISS comparison | Medium | ❌ Not started |
+| Benchmarks | vs FAISS comparison | Medium | ✅ Done (see Benchmark Results) |
 
 #### Shaders
 
@@ -83,6 +83,45 @@ sprint once benchmarks establish it as a bottleneck.
 **Metric support**: both `Metric::L2` and `Metric::IP` (negated inner product
 for min-heap compatibility) are fully implemented and tested.
 
+#### Benchmark Results
+
+Hardware: NVIDIA GeForce RTX 4080 Laptop GPU · CUDA 12.0 · driver 580
+Date: 2026-02-23 · CatWhisper fp16 mode · FAISS 1.13.2
+
+| Config | CatWhisper fp16 | FAISS-GPU single | FAISS-CPU single | CW / GPU ratio |
+|--------|----------------|-----------------|-----------------|----------------|
+| 10K × 128, k=10 | 0.937 ms / 1,067 QPS | 0.052 ms / 19,223 QPS | 0.059 ms / 16,843 QPS | 18.0× slower |
+| 100K × 128, k=10 | 1.482 ms / 675 QPS | 0.362 ms / 2,761 QPS | 0.837 ms / 1,194 QPS | 4.1× slower |
+| 100K × 256, k=10 | 7.108 ms / 141 QPS | 0.561 ms / 1,783 QPS | 2.231 ms / 448 QPS | 12.7× slower |
+
+FAISS-GPU batch QPS (amortized over 200-query batches): 1.68M / 86K / 90K QPS for the
+three configs respectively; CatWhisper has no batch search mode yet.
+
+**Analysis of the performance gap:**
+
+- **High per-query launch overhead**: each `search()` creates a fresh `CommandBuffer`,
+  issues two sequential GPU dispatches (distance pass + top-k pass), and calls
+  `vkQueueWaitIdle` after each — roughly 2 full submit+sync cycles before a result is
+  returned.  FAISS-CUDA pipelines kernel launches and overlaps PCIe transfers.
+
+- **10K case (18×)**: only 20 workgroups of compute — the RTX 4080 barely wakes up.
+  The entire 0.937 ms is Vulkan driver overhead, not arithmetic.
+
+- **100K × 256 dim scaling (12.7×)**: worse than the 128-dim case despite 2× the
+  arithmetic because the two sequential barriers amplify latency linearly with
+  throughput demand; FAISS scales sub-linearly due to tensor-core GEMM.
+
+**Phase 1 optimization backlog** (items needed to close the gap, deferred to a
+dedicated sprint before Phase 2):
+
+| Item | Expected gain |
+|------|--------------|
+| Persistent `CommandBuffer` per context — record once, re-submit with new push constants | −50% launch overhead |
+| Fuse distance + top-k into a single shader pass | eliminates inter-pass barrier + second dispatch |
+| Batch search API (`search_batch(queries, k)`) | amortizes launch cost; targets FAISS parity on QPS |
+| Descriptor set caching (avoid re-binding unchanged buffers) | minor, ~5–10% |
+| Subgroup shuffle top-k (replace shared-mem sort with warp-level primitives) | better occupancy on 100K+ |
+
 #### Deliverables
 
 - [x] IndexFlat::add() works
@@ -90,7 +129,8 @@ for min-heap compatibility) are fully implemented and tested.
 - [x] Batch search implemented (loop over single queries)
 - [x] Inner product metric (Metric::IP) implemented and tested
 - [x] GPU top-k sort correct across single and multiple workgroups
-- [ ] Performance within 80% of FAISS IndexFlat (not benchmarked)
+- [x] Benchmarked against FAISS-GPU and FAISS-CPU (see Benchmark Results below)
+- [ ] Performance within 80% of FAISS IndexFlat (currently 4–18× slower; see Phase 1 optimization backlog)
 
 #### Success Criteria
 
@@ -347,7 +387,7 @@ ctest --output-on-failure
 
 ```
 Phase 0: Foundation     [████████░░] 80%  ✅ Complete
-Phase 1: IndexFlat      [█████████░] 90%  ✅ Functional (benchmarks remaining)
+Phase 1: IndexFlat      [██████████] 95%  ✅ Functional + benchmarked (optimization sprint pending)
 Phase 2: IndexIVFFlat   [░░░░░░░░░░] 0%   ← Next up
 Phase 3: IndexIVFPQ     [░░░░░░░░░░] 0%
 Phase 4: IndexHNSW      [░░░░░░░░░░] 0%
@@ -390,7 +430,7 @@ All 41 unit tests passing:
 
 | Metric | Target | Current |
 |--------|--------|---------|
-| IndexFlat throughput | 10M vectors/sec | ⚠️ Not benchmarked |
+| IndexFlat single-query latency | <0.5 ms @ 100K×128 | ⚠️ 1.48 ms (4.1× behind FAISS-GPU; optimization sprint pending) |
 | IndexIVFFlat recall@10 | >95% @ nprobe=32 | ❌ Not implemented |
 | IndexIVFPQ compression | >20x | ❌ Not implemented |
 | IndexHNSW latency | <1ms @ 1M | ❌ Not implemented |

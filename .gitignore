@@ -5,6 +5,7 @@ cmake-build-*/
 out/
 
 # IDE/Editor
+.crush/
 .idea/
 .vscode/
 *.swp

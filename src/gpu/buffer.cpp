@@ -2,6 +2,7 @@
 #include "core/context_impl.hpp"
 #include <catwhisper/buffer.hpp>
 #include <catwhisper/context.hpp>
+#include <catwhisper/pipeline.hpp>
 
 namespace cw {
 
@@ -162,18 +163,19 @@ Expected<void> Buffer::upload(std::span<const uint8_t> data, uint64_t offset) {
     }
     
     std::memcpy(staging->mapped_, data.data(), data.size());
-    
-    // TODO: Implement GPU copy via command buffer
-    // For now, map and copy directly if possible
-    void* dst = nullptr;
-    VkResult result = vmaMapMemory(impl_->ctx->impl_->allocator, impl_->allocation, &dst);
-    if (result == VK_SUCCESS) {
-        std::memcpy(static_cast<uint8_t*>(dst) + offset, data.data(), data.size());
-        vmaUnmapMemory(impl_->ctx->impl_->allocator, impl_->allocation);
-        return {};
+
+    // GPU copy: staging (host-visible) → this buffer (device-local).
+    auto cmd_result = CommandBuffer::create(*impl_->ctx);
+    if (!cmd_result) {
+        return make_unexpected(cmd_result.error().code(),
+                               "Failed to create command buffer for staging upload: " +
+                               cmd_result.error().message());
     }
-    
-    return make_unexpected(ErrorCode::OperationFailed, "Failed to upload to buffer");
+    auto cmd = std::move(*cmd_result);
+    cmd.begin();
+    cmd.copy_buffer(*staging, *this, data.size(), /*src_off=*/0, offset);
+    cmd.end();
+    return submit_and_wait(*impl_->ctx, cmd);
 }
 
 Expected<void> Buffer::download(std::span<uint8_t> data, uint64_t offset) {
