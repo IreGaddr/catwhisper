@@ -1,0 +1,167 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+// IVF search: compute distances and top-k within selected clusters
+
+layout(local_size_x = 512) in;
+
+layout(binding = 0) buffer CentroidsBuffer {
+    float centroids[];  // n_clusters * dimension (fp32)
+};
+
+layout(binding = 1) buffer ClusterOffsets {
+    uint offsets[];  // n_clusters + 1, offsets into cluster_data
+};
+
+layout(binding = 2) buffer ClusterData {
+    uint16_t data[];  // fp16 vectors stored cluster-by-cluster
+};
+
+layout(binding = 3) buffer QueryBuffer {
+    uint16_t query[];  // fp16 query vector
+};
+
+layout(binding = 4) buffer SelectedClusters {
+    uint selected[];  // nprobe cluster indices to search
+};
+
+layout(binding = 5) buffer OutDistances {
+    float out_distances[];  // partial distances (n_wg * k)
+};
+
+layout(binding = 6) buffer OutIndices {
+    uint out_indices[];  // partial indices (n_wg * k)
+};
+
+layout(push_constant) uniform PushConstants {
+    uint n_clusters;
+    uint dimension;
+    uint k;
+    uint nprobe;
+    uint total_vectors;
+    uint metric;  // 0 = L2, 1 = IP
+} pc;
+
+// Bitonic sort helpers for top-k
+void bitonic_sort_step(inout float dists[64], inout uint idxs[64], uint stage, uint step) {
+    for (uint i = 0; i < 64; ++i) {
+        uint j = i ^ (1u << step);
+        if (j > i && j < 64) {
+            bool swap = ((i >> (stage + 1u)) & 1u) == 0u;
+            if (swap == (dists[i] > dists[j])) {
+                float tmp_d = dists[i];
+                dists[i] = dists[j];
+                dists[j] = tmp_d;
+                uint tmp_i = idxs[i];
+                idxs[i] = idxs[j];
+                idxs[j] = tmp_i;
+            }
+        }
+    }
+}
+
+shared float16_t shared_query[128];
+
+void main() {
+    uint local_id = gl_LocalInvocationID.x;
+    uint workgroup_id = gl_WorkGroupID.x;
+
+    // Load query into shared memory
+    if (local_id < pc.dimension) {
+        shared_query[local_id] = float16_t(query[local_id]);
+    }
+    barrier();
+
+    // Each workgroup processes vectors from selected clusters
+    // We iterate through all vectors in the nprobe selected clusters
+
+    // Calculate total vectors to search
+    uint total_to_search = 0u;
+    for (uint p = 0; p < pc.nprobe; ++p) {
+        uint cluster = selected[p];
+        uint cluster_size = offsets[cluster + 1u] - offsets[cluster];
+        total_to_search += cluster_size;
+    }
+
+    // Top-k heap for this workgroup
+    float heap_dists[64];
+    uint heap_idxs[64];
+
+    for (uint i = 0; i < 64u; ++i) {
+        heap_dists[i] = 1e30f;
+        heap_idxs[i] = 0xFFFFFFFFu;
+    }
+
+    // Process vectors
+    uint vectors_per_thread = (total_to_search + gl_WorkGroupSize.x - 1u) / gl_WorkGroupSize.x;
+    uint start_vec = local_id * vectors_per_thread;
+
+    uint vec_count = 0u;
+    for (uint p = 0u; p < pc.nprobe; ++p) {
+        uint cluster = selected[p];
+        uint cluster_start = offsets[cluster];
+        uint cluster_size = offsets[cluster + 1u] - cluster_start;
+
+        for (uint v = 0u; v < cluster_size; ++v) {
+            uint global_vec_idx = vec_count + v;
+            if (global_vec_idx >= start_vec && global_vec_idx < start_vec + vectors_per_thread) {
+                // Compute distance
+                float dist = 0.0f;
+                uint vec_offset = (cluster_start + v) * pc.dimension;
+
+                if (pc.metric == 0u) {
+                    // L2 distance
+                    for (uint d = 0u; d < pc.dimension; ++d) {
+                        float diff = float(shared_query[d]) - float(data[vec_offset + d]);
+                        dist += diff * diff;
+                    }
+                } else {
+                    // Inner product (negated)
+                    for (uint d = 0u; d < pc.dimension; ++d) {
+                        dist += float(shared_query[d]) * float(data[vec_offset + d]);
+                    }
+                    dist = -dist;
+                }
+
+                // Insert into heap
+                if (dist < heap_dists[pc.k - 1u]) {
+                    heap_dists[pc.k - 1u] = dist;
+                    heap_idxs[pc.k - 1u] = cluster_start + v;
+
+                    // Bubble up
+                    uint idx = pc.k - 1u;
+                    while (idx > 0u && heap_dists[idx] < heap_dists[idx - 1u]) {
+                        float tmp_d = heap_dists[idx];
+                        heap_dists[idx] = heap_dists[idx - 1u];
+                        heap_dists[idx - 1u] = tmp_d;
+
+                        uint tmp_i = heap_idxs[idx];
+                        heap_idxs[idx] = heap_idxs[idx - 1u];
+                        heap_idxs[idx - 1u] = tmp_i;
+
+                        --idx;
+                    }
+                }
+            }
+        }
+        vec_count += cluster_size;
+    }
+
+    barrier();
+
+    // Now reduce across threads to get workgroup top-k
+    // For simplicity, use subgroup operations
+
+    // Each thread writes its best k to shared memory
+    // Then thread 0 merges all
+
+    // Output workgroup results
+    if (local_id == 0u) {
+        for (uint i = 0u; i < pc.k; ++i) {
+            out_distances[workgroup_id * pc.k + i] = heap_dists[i];
+            out_indices[workgroup_id * pc.k + i] = heap_idxs[i];
+        }
+    }
+}

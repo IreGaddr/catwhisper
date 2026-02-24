@@ -1,8 +1,10 @@
 # Build directories
 .build/
 build/
+build_*/
 cmake-build-*/
 out/
+
 
 # IDE/Editor
 .crush/

@@ -51,6 +51,12 @@ struct IndexStats {
     bool is_trained = false;
 };
 
+struct IVFParams {
+    uint32_t nlist = 256;    // Number of clusters/Voronoi cells
+    uint32_t nprobe = 1;     // Number of clusters to search
+    uint32_t kmeans_iters = 20;  // K-means iterations for training
+};
+
 struct DeviceInfo {
     uint32_t device_id = 0;
     std::string name;

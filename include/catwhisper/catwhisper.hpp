@@ -9,6 +9,7 @@
 #include <catwhisper/pipeline.hpp>
 #include <catwhisper/index.hpp>
 #include <catwhisper/index_flat.hpp>
+#include <catwhisper/index_ivf_flat.hpp>
 #include <catwhisper/distance.hpp>
 
 namespace catwhisper = cw;
