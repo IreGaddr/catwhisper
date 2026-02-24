@@ -53,12 +53,12 @@ std::cout << ctx.device_info().name << std::endl;
 | Task | Description | Priority | Status |
 |------|-------------|----------|--------|
 | distance_l2.comp | L2 distance compute shader | Critical | ✅ Done |
-| distance_ip.comp | Inner product shader | Critical | ❌ Not started |
-| topk_select.comp | Top-k heap selection | Critical | ⚠️ Partial (CPU sort used) |
+| distance_ip.comp | Inner product shader | Critical | ✅ Done |
+| topk_select.comp | Top-k heap selection | Critical | ✅ Done (GPU bitonic sort + CPU merge) |
 | IndexFlat class | Host-side implementation | Critical | ✅ Done |
 | Data upload | Host → GPU staging and transfer | Critical | ✅ Done |
 | Result download | GPU → Host readback | Critical | ✅ Done |
-| Unit tests | IndexFlat test coverage | High | ✅ Done (35 tests) |
+| Unit tests | IndexFlat test coverage | High | ✅ Done (41 tests) |
 | Benchmarks | vs FAISS comparison | Medium | ❌ Not started |
 
 #### Shaders
@@ -66,16 +66,30 @@ std::cout << ctx.device_info().name << std::endl;
 ```
 shaders/
 ├── distance_l2.comp       # L2 distance computation ✅
-├── distance_ip.comp       # Inner product computation ❌
+├── distance_ip.comp       # Inner product computation ✅
 ├── distance_cosine.comp   # Cosine distance (optional, can normalize + IP) ❌
-└── topk_heap.comp         # Heap-based top-k selection ⚠️ (exists, CPU fallback used)
+└── topk_heap.comp         # Per-workgroup ascending bitonic sort top-k ✅
 ```
+
+#### Implementation Notes
+
+**Top-k strategy**: GPU computes all per-vector distances, then `topk_heap.comp`
+runs a correct ascending bitonic sort over 512-element workgroup tiles, writing
+`k` candidates per workgroup.  The host CPU-merges the `n_workgroups × k`
+partial results via `std::partial_sort` — typically a few thousand elements,
+negligible latency.  A fully-GPU merge pass is deferred to a future optimisation
+sprint once benchmarks establish it as a bottleneck.
+
+**Metric support**: both `Metric::L2` and `Metric::IP` (negated inner product
+for min-heap compatibility) are fully implemented and tested.
 
 #### Deliverables
 
 - [x] IndexFlat::add() works
 - [x] IndexFlat::search() returns correct results
 - [x] Batch search implemented (loop over single queries)
+- [x] Inner product metric (Metric::IP) implemented and tested
+- [x] GPU top-k sort correct across single and multiple workgroups
 - [ ] Performance within 80% of FAISS IndexFlat (not benchmarked)
 
 #### Success Criteria
@@ -333,7 +347,7 @@ ctest --output-on-failure
 
 ```
 Phase 0: Foundation     [████████░░] 80%  ✅ Complete
-Phase 1: IndexFlat      [████████░░] 80%  ✅ Functional (needs GPU top-k)
+Phase 1: IndexFlat      [█████████░] 90%  ✅ Functional (benchmarks remaining)
 Phase 2: IndexIVFFlat   [░░░░░░░░░░] 0%   ← Next up
 Phase 3: IndexIVFPQ     [░░░░░░░░░░] 0%
 Phase 4: IndexHNSW      [░░░░░░░░░░] 0%
@@ -358,17 +372,19 @@ Phase 5: Production     [░░░░░░░░░░] 0%
 | Shader | File | Status |
 |--------|------|--------|
 | L2 Distance | `distance_l2.comp` | ✅ Complete |
-| Top-K Heap | `topk_heap.comp` | ⚠️ Exists but CPU fallback used |
+| Inner Product | `distance_ip.comp` | ✅ Complete |
+| Top-K Bitonic Sort | `topk_heap.comp` | ✅ Complete (GPU sort + CPU merge) |
 
 ### Tests
 
-All 35 unit tests passing:
+All 41 unit tests passing:
 - BufferTest (5 tests)
 - ContextTest (5 tests)
 - ErrorTest (6 tests)
-- IndexFlatTest (9 tests)
+- IndexFlatTest (13 tests)
 - MinimalTest (5 tests)
 - TypesTest (5 tests)
+- IntegrationTest (2 tests)
 
 ## Success Metrics
 
