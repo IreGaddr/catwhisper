@@ -11,6 +11,8 @@ set(SHADER_SOURCES
     distance_l2.comp
     distance_ip.comp
     topk_heap.comp
+    distance_topk_fused.comp
+    distance_topk_batch.comp
 )
 
 set(SHADER_OUTPUTS "")

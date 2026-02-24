@@ -83,7 +83,14 @@ public:
 
     static Expected<CommandBuffer> create(Context& ctx);
 
+    // One-time-submit begin; command buffer becomes invalid after submission.
     void begin();
+    // Reusable begin (flags=0); after submission+wait the buffer returns to
+    // Executable state and can be re-submitted without re-recording.
+    void begin_reusable();
+    // Reset to Initial state for re-recording (requires pool with
+    // VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT).
+    void reset();
     void end();
 
     void bind_pipeline(const Pipeline& pipeline);

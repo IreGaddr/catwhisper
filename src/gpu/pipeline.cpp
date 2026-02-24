@@ -345,6 +345,22 @@ void CommandBuffer::begin() {
     vkBeginCommandBuffer(impl_->cmd, &begin_info);
 }
 
+void CommandBuffer::begin_reusable() {
+    // flags = 0: no ONE_TIME_SUBMIT_BIT.  After the fence signals the buffer
+    // returns to Executable state and may be re-submitted without re-recording.
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = 0
+    };
+    vkBeginCommandBuffer(impl_->cmd, &begin_info);
+}
+
+void CommandBuffer::reset() {
+    // Transitions Executable/Invalid → Initial so the buffer can be re-recorded.
+    // The pool must have VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT.
+    vkResetCommandBuffer(impl_->cmd, 0);
+}
+
 void CommandBuffer::end() {
     vkEndCommandBuffer(impl_->cmd);
 }
@@ -402,29 +418,24 @@ void* CommandBuffer::vulkan_command_buffer() const {
 }
 
 Expected<void> submit_and_wait(Context& ctx, CommandBuffer& cmd) {
+    // Reuse the persistent per-context fence instead of allocating a new one
+    // on every call.  The fence starts unsignaled (created with no flags), so we
+    // reset it before each use.  Submissions are always serialised through this
+    // function (every caller blocks until completion), so there is no aliasing.
+    VkFence fence = ctx.impl_->compute_fence;
+    vkResetFences(ctx.impl_->device, 1, &fence);
+
     VkSubmitInfo submit_info = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1,
         .pCommandBuffers = &cmd.impl_->cmd
     };
-    
-    VkFence fence;
-    VkFenceCreateInfo fence_info = {
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
-    };
-    
-    if (vkCreateFence(ctx.impl_->device, &fence_info, nullptr, &fence) != VK_SUCCESS) {
-        return make_unexpected(ErrorCode::OperationFailed, "Failed to create fence");
-    }
-    
+
     if (vkQueueSubmit(ctx.impl_->compute_queue, 1, &submit_info, fence) != VK_SUCCESS) {
-        vkDestroyFence(ctx.impl_->device, fence, nullptr);
         return make_unexpected(ErrorCode::OperationFailed, "Failed to submit queue");
     }
-    
+
     vkWaitForFences(ctx.impl_->device, 1, &fence, VK_TRUE, UINT64_MAX);
-    vkDestroyFence(ctx.impl_->device, fence, nullptr);
-    
     return {};
 }
 

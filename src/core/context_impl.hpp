@@ -21,6 +21,7 @@ struct Context::Impl {
     VkDevice device = VK_NULL_HANDLE;
     VkQueue compute_queue = VK_NULL_HANDLE;
     VkCommandPool command_pool = VK_NULL_HANDLE;
+    VkFence       compute_fence = VK_NULL_HANDLE;  // persistent; reset before each submit
     VmaAllocator allocator = VK_NULL_HANDLE;
     
     uint32_t compute_queue_family = 0;
@@ -89,6 +90,10 @@ struct Context::Impl {
         if (allocator) {
             vmaDestroyAllocator(allocator);
             allocator = VK_NULL_HANDLE;
+        }
+        if (compute_fence) {
+            vkDestroyFence(device, compute_fence, nullptr);
+            compute_fence = VK_NULL_HANDLE;
         }
         if (command_pool) {
             vkDestroyCommandPool(device, command_pool, nullptr);
@@ -250,7 +255,13 @@ private:
             return make_unexpected(ErrorCode::OperationFailed,
                                    "Failed to create command pool");
         }
-        
+
+        VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (vkCreateFence(device, &fence_info, nullptr, &compute_fence) != VK_SUCCESS) {
+            return make_unexpected(ErrorCode::OperationFailed,
+                                   "Failed to create compute fence");
+        }
+
         return {};
     }
     
@@ -297,11 +308,11 @@ private:
         int score = 0;
         
         if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
-            score += 1000;
+            score += 100000;  // Strongly prefer discrete GPUs
         } else if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
-            score += 500;
+            score += 50000;
         } else if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
-            score += 100;
+            score += 1;  // CPU fallback gets minimum score
         }
         
         VkPhysicalDeviceMemoryProperties mem_props;

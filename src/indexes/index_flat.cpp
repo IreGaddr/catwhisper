@@ -59,7 +59,7 @@ static float half_to_float(uint16_t h) {
     return f;
 }
 
-// TOPK_CHUNK must match the CHUNK constant in topk_heap.comp.
+// TOPK_CHUNK must match the CHUNK constant in topk_heap.comp and distance_topk_fused.comp.
 static constexpr uint32_t TOPK_CHUNK = 512u;
 
 struct IndexFlat::Impl {
@@ -73,16 +73,44 @@ struct IndexFlat::Impl {
     Buffer data_buffer;
     Buffer ids_buffer;
 
+    // Legacy two-pass pipelines (kept for fallback)
     Pipeline distance_l2_pipeline;
     Pipeline distance_ip_pipeline;
     Pipeline topk_pipeline;
     DescriptorSet distance_desc_set;
     DescriptorSet topk_desc_set;
 
+    // Fused single-pass pipeline
+    Pipeline fused_l2_pipeline;
+    Pipeline fused_ip_pipeline;
+    DescriptorSet fused_desc_set;
+
+    // Batch search pipeline
+    Pipeline batch_pipeline;
+    DescriptorSet batch_desc_set;
+    Buffer batch_query_buffer;
+    Buffer batch_result_distances_buffer;
+    Buffer batch_result_indices_buffer;
+
     Buffer query_buffer;
     Buffer distance_buffer;
     Buffer result_distances_buffer;
     Buffer result_indices_buffer;
+
+    // Persistent command buffer for search (reused across calls)
+    CommandBuffer search_cmd;
+    bool search_cmd_valid = false;
+    uint32_t search_cmd_k = 0;
+    uint64_t search_cmd_n_vectors = 0;
+    uint32_t last_used_k = 0;
+
+    // Cached VkBuffer handles for the fused descriptor set.
+    // vkUpdateDescriptorSets is only called when a handle actually changes,
+    // avoiding 4 driver round-trips on every query in the common steady state.
+    VkBuffer fused_bound_data     = VK_NULL_HANDLE;
+    VkBuffer fused_bound_query    = VK_NULL_HANDLE;
+    VkBuffer fused_bound_rdist    = VK_NULL_HANDLE;
+    VkBuffer fused_bound_ridx     = VK_NULL_HANDLE;
 
     std::vector<VectorId> id_mapping;
 };
@@ -183,7 +211,63 @@ Expected<void> IndexFlat::init_pipelines() {
                                "Failed to create topk descriptor set");
     }
     impl_->topk_desc_set = std::move(*topk_desc_result);
-    
+
+    // ---- Fused L2 distance + top-k pipeline ----
+    PipelineDesc fused_l2_desc;
+    fused_l2_desc.shader_name = "distance_topk_fused";
+    fused_l2_desc.bindings = {
+        {0, DescriptorBinding::StorageBuffer},  // database
+        {1, DescriptorBinding::StorageBuffer},  // query
+        {2, DescriptorBinding::StorageBuffer},  // out_distances
+        {3, DescriptorBinding::StorageBuffer},  // out_indices
+    };
+    fused_l2_desc.push_constant_size = 16;  // n_vectors, dimension, k, metric
+
+    auto fused_l2_result = Pipeline::create(*impl_->ctx, fused_l2_desc);
+    if (!fused_l2_result) {
+        return make_unexpected(fused_l2_result.error().code(),
+                               "Failed to create fused L2 pipeline: " + fused_l2_result.error().message());
+    }
+    impl_->fused_l2_pipeline = std::move(*fused_l2_result);
+
+    // Fused IP pipeline uses same shader with metric=1 push constant
+    impl_->fused_ip_pipeline = std::move(*Pipeline::create(*impl_->ctx, fused_l2_desc));
+    if (!impl_->fused_ip_pipeline.valid()) {
+        return make_unexpected(ErrorCode::OperationFailed, "Failed to create fused IP pipeline");
+    }
+
+    auto fused_desc_result = DescriptorSet::create(*impl_->ctx, impl_->fused_l2_pipeline);
+    if (!fused_desc_result) {
+        return make_unexpected(fused_desc_result.error().code(),
+                               "Failed to create fused descriptor set");
+    }
+    impl_->fused_desc_set = std::move(*fused_desc_result);
+
+    // ---- Batch search pipeline (2D dispatch for multiple queries) ----
+    PipelineDesc batch_desc;
+    batch_desc.shader_name = "distance_topk_batch";
+    batch_desc.bindings = {
+        {0, DescriptorBinding::StorageBuffer},  // database
+        {1, DescriptorBinding::StorageBuffer},  // queries (n_queries * dimension)
+        {2, DescriptorBinding::StorageBuffer},  // out_distances
+        {3, DescriptorBinding::StorageBuffer},  // out_indices
+    };
+    batch_desc.push_constant_size = 20;  // n_vectors, dimension, k, n_queries, metric
+
+    auto batch_result = Pipeline::create(*impl_->ctx, batch_desc);
+    if (!batch_result) {
+        return make_unexpected(batch_result.error().code(),
+                               "Failed to create batch pipeline: " + batch_result.error().message());
+    }
+    impl_->batch_pipeline = std::move(*batch_result);
+
+    auto batch_desc_result = DescriptorSet::create(*impl_->ctx, impl_->batch_pipeline);
+    if (!batch_desc_result) {
+        return make_unexpected(batch_desc_result.error().code(),
+                               "Failed to create batch descriptor set");
+    }
+    impl_->batch_desc_set = std::move(*batch_desc_result);
+
     return {};
 }
 
@@ -319,42 +403,28 @@ Expected<SearchResults> IndexFlat::search(Vector query, uint32_t k) {
     
     SearchResults results(1, k);
     
-    auto bind_result = impl_->distance_desc_set.bind_buffer(0, impl_->data_buffer);
-    if (!bind_result) {
-        return make_unexpected(bind_result.error().code(), bind_result.error().message());
-    }
-    
+    // ---- Ensure query buffer exists and is large enough ----
     uint64_t element_size = impl_->use_fp16 ? sizeof(uint16_t) : sizeof(float);
     
     if (!impl_->query_buffer.valid() || impl_->query_buffer.size() < impl_->dimension * element_size) {
         BufferDesc query_desc = {};
         query_desc.size = impl_->dimension * element_size;
         query_desc.usage = BufferUsage::Storage | BufferUsage::TransferDst;
-        query_desc.memory_type = MemoryType::DeviceLocal;
-        
+        // HostCoherent + permanently mapped: Buffer::upload() takes the fast
+        // memcpy path and never creates a staging buffer or issues a
+        // submit_and_wait, cutting one full fence cycle per query.
+        query_desc.memory_type = MemoryType::HostCoherent;
+        query_desc.map_on_create = true;
+
         auto qbuf = Buffer::create(*impl_->ctx, query_desc);
         if (!qbuf) {
             return make_unexpected(qbuf.error().code(), "Failed to create query buffer");
         }
         impl_->query_buffer = std::move(*qbuf);
+        impl_->fused_bound_query = VK_NULL_HANDLE;  // force descriptor rebind
     }
     
-    uint64_t dist_buffer_size = std::max(impl_->n_vectors * sizeof(float), uint64_t(4096));
-    if (!impl_->distance_buffer.valid() || impl_->distance_buffer.size() < dist_buffer_size) {
-        BufferDesc dist_desc = {};
-        dist_desc.size = dist_buffer_size;
-        dist_desc.usage = BufferUsage::Storage | BufferUsage::TransferSrc | BufferUsage::TransferDst;
-        dist_desc.memory_type = MemoryType::HostVisible;
-        dist_desc.map_on_create = true;
-        
-        auto dbuf = Buffer::create(*impl_->ctx, dist_desc);
-        if (!dbuf) {
-            return make_unexpected(dbuf.error().code(), "Failed to create distance buffer");
-        }
-        impl_->distance_buffer = std::move(*dbuf);
-    }
-    
-    // Upload query
+    // ---- Upload query ----
     std::vector<uint8_t> query_bytes;
     if (impl_->use_fp16) {
         query_bytes.resize(impl_->dimension * sizeof(uint16_t));
@@ -372,26 +442,7 @@ Expected<SearchResults> IndexFlat::search(Vector query, uint32_t k) {
         return make_unexpected(upload_result.error().code(), "Failed to upload query");
     }
     
-    bind_result = impl_->distance_desc_set.bind_buffer(1, impl_->query_buffer);
-    if (!bind_result) {
-        return make_unexpected(bind_result.error().code(), bind_result.error().message());
-    }
-    
-    bind_result = impl_->distance_desc_set.bind_buffer(2, impl_->distance_buffer);
-    if (!bind_result) {
-        return make_unexpected(bind_result.error().code(), bind_result.error().message());
-    }
-    
-    // Clear distance buffer to zeros before dispatch.
-    std::vector<uint8_t> zeros(impl_->n_vectors * sizeof(float), 0);
-    auto clear_result = impl_->distance_buffer.upload(zeros);
-    if (!clear_result) {
-        return make_unexpected(clear_result.error().code(), "Failed to clear distance buffer");
-    }
-
-    // --- Allocate / grow partial-result buffers ----------------------------
-    // Pass 0 of the top-k shader writes k candidates per workgroup.
-    // The host then CPU-merges those n_workgroups*k candidates.
+    // ---- Allocate partial-result buffers ----
     uint32_t n_topk_wg = (static_cast<uint32_t>(impl_->n_vectors) + TOPK_CHUNK - 1u) / TOPK_CHUNK;
     uint64_t partial_size = static_cast<uint64_t>(n_topk_wg) * k * sizeof(float);
 
@@ -415,85 +466,115 @@ Expected<SearchResults> IndexFlat::search(Vector query, uint32_t k) {
             return make_unexpected(ribuf.error().code(), "Failed to create result indices buffer");
         }
         impl_->result_indices_buffer = std::move(*ribuf);
+
+        // Invalidate cached command buffer since result buffers changed
+        impl_->search_cmd_valid = false;
     }
 
-    // --- Bind top-k descriptor set ----------------------------------------
-    auto bind_topk = impl_->topk_desc_set.bind_buffer(0, impl_->distance_buffer);
-    if (!bind_topk) {
-        return make_unexpected(bind_topk.error().code(), bind_topk.error().message());
+    // ---- Update fused descriptor set only when VkBuffer handles change ----
+    // submit_and_wait guarantees the previous submission has completed before we
+    // reach this point, so the descriptor set is not "in use" and
+    // vkUpdateDescriptorSets is safe.  On steady-state queries (same index, same
+    // k) all four handles are identical and no driver calls are made.
+    {
+        auto cur_data  = reinterpret_cast<VkBuffer>(impl_->data_buffer.vulkan_buffer());
+        auto cur_query = reinterpret_cast<VkBuffer>(impl_->query_buffer.vulkan_buffer());
+        auto cur_rdist = reinterpret_cast<VkBuffer>(impl_->result_distances_buffer.vulkan_buffer());
+        auto cur_ridx  = reinterpret_cast<VkBuffer>(impl_->result_indices_buffer.vulkan_buffer());
+
+        if (cur_data != impl_->fused_bound_data) {
+            auto r = impl_->fused_desc_set.bind_buffer(0, impl_->data_buffer);
+            if (!r) return make_unexpected(r.error().code(), r.error().message());
+            impl_->fused_bound_data  = cur_data;
+            impl_->search_cmd_valid  = false;  // dispatch count depends on n_vectors
+        }
+        if (cur_query != impl_->fused_bound_query) {
+            auto r = impl_->fused_desc_set.bind_buffer(1, impl_->query_buffer);
+            if (!r) return make_unexpected(r.error().code(), r.error().message());
+            impl_->fused_bound_query = cur_query;
+            // Query buffer handle is constant across queries; only its contents
+            // change (via memcpy into the mapped region).  The recorded cmd
+            // references the descriptor set handle, not the buffer contents, so
+            // cmd validity is unaffected.
+        }
+        if (cur_rdist != impl_->fused_bound_rdist) {
+            auto r = impl_->fused_desc_set.bind_buffer(2, impl_->result_distances_buffer);
+            if (!r) return make_unexpected(r.error().code(), r.error().message());
+            impl_->fused_bound_rdist = cur_rdist;
+            impl_->search_cmd_valid  = false;
+        }
+        if (cur_ridx != impl_->fused_bound_ridx) {
+            auto r = impl_->fused_desc_set.bind_buffer(3, impl_->result_indices_buffer);
+            if (!r) return make_unexpected(r.error().code(), r.error().message());
+            impl_->fused_bound_ridx  = cur_ridx;
+            impl_->search_cmd_valid  = false;
+        }
     }
-    bind_topk = impl_->topk_desc_set.bind_buffer(1, impl_->result_distances_buffer);
-    if (!bind_topk) {
-        return make_unexpected(bind_topk.error().code(), bind_topk.error().message());
+
+    // ---- Select pipeline based on metric ----
+    Pipeline& fused_pipeline = (impl_->metric == Metric::IP)
+        ? impl_->fused_ip_pipeline
+        : impl_->fused_l2_pipeline;
+
+    // ---- Record or reuse command buffer ----
+    // need_rerecord is true on first call, when k changes, when n_vectors changes,
+    // or when a buffer handle changed above (search_cmd_valid was cleared).
+    bool need_rerecord = !impl_->search_cmd_valid ||
+                         impl_->search_cmd_k != k ||
+                         impl_->search_cmd_n_vectors != impl_->n_vectors;
+
+    if (need_rerecord) {
+        if (!impl_->search_cmd.valid()) {
+            // First-ever recording: allocate a new command buffer.
+            auto cmd_result = CommandBuffer::create(*impl_->ctx);
+            if (!cmd_result) {
+                return make_unexpected(cmd_result.error().code(), cmd_result.error().message());
+            }
+            impl_->search_cmd = std::move(*cmd_result);
+        } else {
+            // Subsequent re-recordings: reset to Initial state.
+            // VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT is set on the pool.
+            impl_->search_cmd.reset();
+        }
+
+        // begin_reusable() uses flags=0 (no ONE_TIME_SUBMIT_BIT) so after
+        // submission+wait the buffer returns to Executable state and can be
+        // re-submitted for the next query without re-recording.
+        impl_->search_cmd.begin_reusable();
+        impl_->search_cmd.bind_pipeline(fused_pipeline);
+        impl_->search_cmd.bind_descriptor_set(fused_pipeline, impl_->fused_desc_set);
+
+        struct FusedPushConstants {
+            uint32_t n_vectors;
+            uint32_t dimension;
+            uint32_t k;
+            uint32_t metric;  // 0 = L2, 1 = IP
+        } fpc = {
+            static_cast<uint32_t>(impl_->n_vectors),
+            impl_->dimension,
+            k,
+            (impl_->metric == Metric::IP) ? 1u : 0u
+        };
+        impl_->search_cmd.push_constants(fused_pipeline, &fpc, sizeof(fpc));
+        impl_->search_cmd.dispatch(n_topk_wg);
+        impl_->search_cmd.end();
+
+        impl_->search_cmd_valid       = true;
+        impl_->search_cmd_k           = k;
+        impl_->search_cmd_n_vectors   = impl_->n_vectors;
     }
-    bind_topk = impl_->topk_desc_set.bind_buffer(2, impl_->result_indices_buffer);
-    if (!bind_topk) {
-        return make_unexpected(bind_topk.error().code(), bind_topk.error().message());
-    }
+    // Else: search_cmd is in Executable state (completed after last wait, flags=0).
+    // The query buffer contents were updated via memcpy into its mapped region.
+    // The descriptor set still points to the same VkBuffers; GPU reads current
+    // contents at execution time.  Re-submit directly.
 
-    // --- Record and submit the command buffer ------------------------------
-    auto cmd_result = CommandBuffer::create(*impl_->ctx);
-    if (!cmd_result) {
-        return make_unexpected(cmd_result.error().code(), cmd_result.error().message());
-    }
-    auto cmd = std::move(*cmd_result);
-    cmd.begin();
-
-    // Select distance pipeline based on metric.
-    Pipeline& distance_pipeline = (impl_->metric == Metric::IP)
-        ? impl_->distance_ip_pipeline
-        : impl_->distance_l2_pipeline;
-
-    // Pass A: compute per-vector distances.
-    cmd.bind_pipeline(distance_pipeline);
-    cmd.bind_descriptor_set(distance_pipeline, impl_->distance_desc_set);
-
-    struct DistancePushConstants {
-        uint32_t n_vectors;
-        uint32_t dimension;
-        uint32_t query_offset;
-        uint32_t pad;
-    } dpc = {
-        static_cast<uint32_t>(impl_->n_vectors),
-        impl_->dimension,
-        0u,
-        0u
-    };
-    cmd.push_constants(distance_pipeline, &dpc, sizeof(dpc));
-
-    uint32_t dist_wg = (static_cast<uint32_t>(impl_->n_vectors) + 255u) / 256u;
-    cmd.dispatch(dist_wg);
-
-    // Barrier: distance writes must complete before top-k reads them.
-    cmd.barrier();
-
-    // Pass B: per-workgroup bitonic-sort top-k.
-    cmd.bind_pipeline(impl_->topk_pipeline);
-    cmd.bind_descriptor_set(impl_->topk_pipeline, impl_->topk_desc_set);
-
-    struct TopKPushConstants {
-        uint32_t n_vectors;
-        uint32_t k;
-        uint32_t pad0;
-        uint32_t pad1;
-    } tpc = {
-        static_cast<uint32_t>(impl_->n_vectors),
-        k,
-        0u,
-        0u
-    };
-    cmd.push_constants(impl_->topk_pipeline, &tpc, sizeof(tpc));
-    cmd.dispatch(n_topk_wg);
-
-    cmd.barrier();
-    cmd.end();
-
-    auto submit_result = submit_and_wait(*impl_->ctx, cmd);
+    // ---- Submit and wait ----
+    auto submit_result = submit_and_wait(*impl_->ctx, impl_->search_cmd);
     if (!submit_result) {
         return make_unexpected(submit_result.error().code(), submit_result.error().message());
     }
 
-    // --- CPU merge: find global top-k from n_topk_wg * k candidates -------
+    // ---- CPU merge: find global top-k from n_topk_wg * k candidates ----
     uint32_t n_partial = n_topk_wg * k;
     std::vector<uint8_t> dist_bytes(static_cast<uint64_t>(n_partial) * sizeof(float));
     std::vector<uint8_t> idx_bytes(static_cast<uint64_t>(n_partial) * sizeof(uint32_t));
@@ -544,17 +625,142 @@ Expected<SearchResults> IndexFlat::search(std::span<const float> queries,
         return make_unexpected(ErrorCode::InvalidParameter, "Index not initialized");
     }
     
+    if (impl_->n_vectors == 0) {
+        return SearchResults(n_queries, k);
+    }
+    
     SearchResults results(n_queries, k);
+    uint64_t element_size = impl_->use_fp16 ? sizeof(uint16_t) : sizeof(float);
+    
+    // ---- Allocate batch query buffer ----
+    uint64_t batch_query_size = n_queries * impl_->dimension * element_size;
+    if (!impl_->batch_query_buffer.valid() || impl_->batch_query_buffer.size() < batch_query_size) {
+        BufferDesc qdesc = {};
+        qdesc.size = batch_query_size;
+        qdesc.usage = BufferUsage::Storage | BufferUsage::TransferDst;
+        qdesc.memory_type = MemoryType::DeviceLocal;
+        auto qbuf = Buffer::create(*impl_->ctx, qdesc);
+        if (!qbuf) {
+            return make_unexpected(qbuf.error().code(), "Failed to create batch query buffer");
+        }
+        impl_->batch_query_buffer = std::move(*qbuf);
+    }
+    
+    // ---- Upload all queries ----
+    std::vector<uint8_t> query_bytes;
+    if (impl_->use_fp16) {
+        query_bytes.resize(n_queries * impl_->dimension * sizeof(uint16_t));
+        uint16_t* fp16_ptr = reinterpret_cast<uint16_t*>(query_bytes.data());
+        for (uint64_t q = 0; q < n_queries; ++q) {
+            for (uint32_t d = 0; d < impl_->dimension; ++d) {
+                fp16_ptr[q * impl_->dimension + d] = float_to_half(queries[q * impl_->dimension + d]);
+            }
+        }
+    } else {
+        query_bytes.resize(n_queries * impl_->dimension * sizeof(float));
+        std::memcpy(query_bytes.data(), queries.data(), query_bytes.size());
+    }
+    auto upload_result = impl_->batch_query_buffer.upload(query_bytes);
+    if (!upload_result) {
+        return make_unexpected(upload_result.error().code(), "Failed to upload batch queries");
+    }
+    
+    // ---- Allocate result buffers ----
+    uint32_t n_wg_x = (static_cast<uint32_t>(impl_->n_vectors) + TOPK_CHUNK - 1u) / TOPK_CHUNK;
+    uint64_t partial_size = n_queries * n_wg_x * k * sizeof(float);
+    
+    if (!impl_->batch_result_distances_buffer.valid() ||
+        impl_->batch_result_distances_buffer.size() < partial_size) {
+        BufferDesc rdesc = {};
+        rdesc.size = partial_size;
+        rdesc.usage = BufferUsage::Storage | BufferUsage::TransferSrc;
+        rdesc.memory_type = MemoryType::HostVisible;
+        rdesc.map_on_create = true;
+        auto rdbuf = Buffer::create(*impl_->ctx, rdesc);
+        if (!rdbuf) {
+            return make_unexpected(rdbuf.error().code(), "Failed to create batch result buffer");
+        }
+        impl_->batch_result_distances_buffer = std::move(*rdbuf);
+        
+        auto ribuf = Buffer::create(*impl_->ctx, rdesc);
+        if (!ribuf) {
+            return make_unexpected(ribuf.error().code(), "Failed to create batch index buffer");
+        }
+        impl_->batch_result_indices_buffer = std::move(*ribuf);
+    }
+    
+    // ---- Bind descriptor set ----
+    auto bind_result = impl_->batch_desc_set.bind_buffer(0, impl_->data_buffer);
+    if (!bind_result) return make_unexpected(bind_result.error().code(), bind_result.error().message());
+    bind_result = impl_->batch_desc_set.bind_buffer(1, impl_->batch_query_buffer);
+    if (!bind_result) return make_unexpected(bind_result.error().code(), bind_result.error().message());
+    bind_result = impl_->batch_desc_set.bind_buffer(2, impl_->batch_result_distances_buffer);
+    if (!bind_result) return make_unexpected(bind_result.error().code(), bind_result.error().message());
+    bind_result = impl_->batch_desc_set.bind_buffer(3, impl_->batch_result_indices_buffer);
+    if (!bind_result) return make_unexpected(bind_result.error().code(), bind_result.error().message());
+    
+    // ---- Record and submit command buffer ----
+    auto cmd_result = CommandBuffer::create(*impl_->ctx);
+    if (!cmd_result) return make_unexpected(cmd_result.error().code(), cmd_result.error().message());
+    auto cmd = std::move(*cmd_result);
+    cmd.begin();
+    cmd.bind_pipeline(impl_->batch_pipeline);
+    cmd.bind_descriptor_set(impl_->batch_pipeline, impl_->batch_desc_set);
+    
+    struct BatchPushConstants {
+        uint32_t n_vectors;
+        uint32_t dimension;
+        uint32_t k;
+        uint32_t n_queries;
+        uint32_t metric;
+    } bpc = {
+        static_cast<uint32_t>(impl_->n_vectors),
+        impl_->dimension,
+        k,
+        static_cast<uint32_t>(n_queries),
+        (impl_->metric == Metric::IP) ? 1u : 0u
+    };
+    cmd.push_constants(impl_->batch_pipeline, &bpc, sizeof(bpc));
+    cmd.dispatch(n_wg_x, static_cast<uint32_t>(n_queries), 1);
+    cmd.end();
+    
+    auto submit_result = submit_and_wait(*impl_->ctx, cmd);
+    if (!submit_result) return make_unexpected(submit_result.error().code(), submit_result.error().message());
+    
+    // ---- Download and merge results for each query ----
+    std::vector<uint8_t> dist_bytes(partial_size);
+    std::vector<uint8_t> idx_bytes(partial_size);
+    
+    auto download_dist = impl_->batch_result_distances_buffer.download(dist_bytes);
+    if (!download_dist) return make_unexpected(download_dist.error().code(), download_dist.error().message());
+    auto download_idx = impl_->batch_result_indices_buffer.download(idx_bytes);
+    if (!download_idx) return make_unexpected(download_idx.error().code(), download_idx.error().message());
+    
+    const float* raw_dists = reinterpret_cast<const float*>(dist_bytes.data());
+    const uint32_t* raw_idxs = reinterpret_cast<const uint32_t*>(idx_bytes.data());
     
     for (uint64_t q = 0; q < n_queries; ++q) {
-        Vector query(queries.data() + q * impl_->dimension, impl_->dimension);
-        auto single_result = search(query, k);
-        if (!single_result) {
-            return single_result;
+        std::vector<std::pair<float, uint32_t>> candidates;
+        candidates.reserve(n_wg_x * k);
+        
+        for (uint32_t wg = 0; wg < n_wg_x; ++wg) {
+            uint64_t base = (q * n_wg_x + wg) * k;
+            for (uint32_t i = 0; i < k; ++i) {
+                uint32_t idx = raw_idxs[base + i];
+                if (idx != 0xFFFFFFFFu && idx < static_cast<uint32_t>(impl_->n_vectors)) {
+                    candidates.emplace_back(raw_dists[base + i], idx);
+                }
+            }
         }
         
-        for (uint32_t i = 0; i < k; ++i) {
-            results.results[q * k + i] = single_result->results[i];
+        uint32_t actual_k = std::min(k, static_cast<uint32_t>(candidates.size()));
+        if (actual_k > 0) {
+            std::partial_sort(candidates.begin(), candidates.begin() + actual_k, candidates.end(),
+                [](const auto& a, const auto& b) { return a.first < b.first; });
+            for (uint32_t i = 0; i < actual_k; ++i) {
+                results.results[q * k + i].distance = candidates[i].first;
+                results.results[q * k + i].id = impl_->id_mapping[candidates[i].second];
+            }
         }
     }
     
