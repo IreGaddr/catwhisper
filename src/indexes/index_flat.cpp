@@ -59,6 +59,9 @@ static float half_to_float(uint16_t h) {
     return f;
 }
 
+// TOPK_CHUNK must match the CHUNK constant in topk_heap.comp.
+static constexpr uint32_t TOPK_CHUNK = 512u;
+
 struct IndexFlat::Impl {
     Context* ctx = nullptr;
     uint32_t dimension = 0;
@@ -66,19 +69,21 @@ struct IndexFlat::Impl {
     uint64_t capacity = 0;
     Metric metric = Metric::L2;
     bool use_fp16 = true;
-    
+
     Buffer data_buffer;
     Buffer ids_buffer;
-    
-    Pipeline distance_pipeline;
+
+    Pipeline distance_l2_pipeline;
+    Pipeline distance_ip_pipeline;
     Pipeline topk_pipeline;
     DescriptorSet distance_desc_set;
-    
+    DescriptorSet topk_desc_set;
+
     Buffer query_buffer;
     Buffer distance_buffer;
     Buffer result_distances_buffer;
     Buffer result_indices_buffer;
-    
+
     std::vector<VectorId> id_mapping;
 };
 
@@ -111,28 +116,73 @@ Expected<IndexFlat> IndexFlat::create(Context& ctx, uint32_t dimension,
 }
 
 Expected<void> IndexFlat::init_pipelines() {
-    PipelineDesc distance_desc;
-    distance_desc.shader_name = "distance_l2";
-    distance_desc.bindings = {
+    // L2 distance pipeline
+    PipelineDesc l2_desc;
+    l2_desc.shader_name = "distance_l2";
+    l2_desc.bindings = {
         {0, DescriptorBinding::StorageBuffer},
         {1, DescriptorBinding::StorageBuffer},
         {2, DescriptorBinding::StorageBuffer}
     };
-    distance_desc.push_constant_size = 16;
+    l2_desc.push_constant_size = 16;
     
-    auto distance_result = Pipeline::create(*impl_->ctx, distance_desc);
-    if (!distance_result) {
-        return make_unexpected(distance_result.error().code(),
-                               "Failed to create distance pipeline: " + distance_result.error().message());
+    auto l2_result = Pipeline::create(*impl_->ctx, l2_desc);
+    if (!l2_result) {
+        return make_unexpected(l2_result.error().code(),
+                               "Failed to create L2 distance pipeline: " + l2_result.error().message());
     }
-    impl_->distance_pipeline = std::move(*distance_result);
+    impl_->distance_l2_pipeline = std::move(*l2_result);
     
-    auto desc_result = DescriptorSet::create(*impl_->ctx, impl_->distance_pipeline);
+    // Inner product pipeline
+    PipelineDesc ip_desc;
+    ip_desc.shader_name = "distance_ip";
+    ip_desc.bindings = {
+        {0, DescriptorBinding::StorageBuffer},
+        {1, DescriptorBinding::StorageBuffer},
+        {2, DescriptorBinding::StorageBuffer}
+    };
+    ip_desc.push_constant_size = 16;
+    
+    auto ip_result = Pipeline::create(*impl_->ctx, ip_desc);
+    if (!ip_result) {
+        return make_unexpected(ip_result.error().code(),
+                               "Failed to create IP distance pipeline: " + ip_result.error().message());
+    }
+    impl_->distance_ip_pipeline = std::move(*ip_result);
+    
+    // Create descriptor set (same layout for both distance pipelines)
+    auto desc_result = DescriptorSet::create(*impl_->ctx, impl_->distance_l2_pipeline);
     if (!desc_result) {
         return make_unexpected(desc_result.error().code(),
                                "Failed to create descriptor set");
     }
     impl_->distance_desc_set = std::move(*desc_result);
+    
+    // Top-k pipeline – 3 bindings: input distances, output distances, output
+    // indices.  The shader computes original indices inline from workgroup/
+    // thread IDs, eliminating the need for a separate sequential-index buffer.
+    PipelineDesc topk_desc;
+    topk_desc.shader_name = "topk_heap";
+    topk_desc.bindings = {
+        {0, DescriptorBinding::StorageBuffer},  // in_distances  (n_vectors floats)
+        {1, DescriptorBinding::StorageBuffer},  // out_distances (n_wg * k floats)
+        {2, DescriptorBinding::StorageBuffer},  // out_indices   (n_wg * k uints)
+    };
+    topk_desc.push_constant_size = 16;
+    
+    auto topk_result = Pipeline::create(*impl_->ctx, topk_desc);
+    if (!topk_result) {
+        return make_unexpected(topk_result.error().code(),
+                               "Failed to create topk pipeline: " + topk_result.error().message());
+    }
+    impl_->topk_pipeline = std::move(*topk_result);
+    
+    auto topk_desc_result = DescriptorSet::create(*impl_->ctx, impl_->topk_pipeline);
+    if (!topk_desc_result) {
+        return make_unexpected(topk_desc_result.error().code(),
+                               "Failed to create topk descriptor set");
+    }
+    impl_->topk_desc_set = std::move(*topk_desc_result);
     
     return {};
 }
@@ -332,71 +382,159 @@ Expected<SearchResults> IndexFlat::search(Vector query, uint32_t k) {
         return make_unexpected(bind_result.error().code(), bind_result.error().message());
     }
     
-    // Clear distance buffer to zeros
+    // Clear distance buffer to zeros before dispatch.
     std::vector<uint8_t> zeros(impl_->n_vectors * sizeof(float), 0);
     auto clear_result = impl_->distance_buffer.upload(zeros);
     if (!clear_result) {
         return make_unexpected(clear_result.error().code(), "Failed to clear distance buffer");
     }
-    
-    // Create command buffer and dispatch compute
+
+    // --- Allocate / grow partial-result buffers ----------------------------
+    // Pass 0 of the top-k shader writes k candidates per workgroup.
+    // The host then CPU-merges those n_workgroups*k candidates.
+    uint32_t n_topk_wg = (static_cast<uint32_t>(impl_->n_vectors) + TOPK_CHUNK - 1u) / TOPK_CHUNK;
+    uint64_t partial_size = static_cast<uint64_t>(n_topk_wg) * k * sizeof(float);
+
+    if (!impl_->result_distances_buffer.valid() ||
+        impl_->result_distances_buffer.size() < partial_size) {
+
+        BufferDesc res_desc = {};
+        res_desc.size = partial_size;
+        res_desc.usage = BufferUsage::Storage | BufferUsage::TransferSrc | BufferUsage::TransferDst;
+        res_desc.memory_type = MemoryType::HostVisible;
+        res_desc.map_on_create = true;
+
+        auto rdbuf = Buffer::create(*impl_->ctx, res_desc);
+        if (!rdbuf) {
+            return make_unexpected(rdbuf.error().code(), "Failed to create result distances buffer");
+        }
+        impl_->result_distances_buffer = std::move(*rdbuf);
+
+        auto ribuf = Buffer::create(*impl_->ctx, res_desc);
+        if (!ribuf) {
+            return make_unexpected(ribuf.error().code(), "Failed to create result indices buffer");
+        }
+        impl_->result_indices_buffer = std::move(*ribuf);
+    }
+
+    // --- Bind top-k descriptor set ----------------------------------------
+    auto bind_topk = impl_->topk_desc_set.bind_buffer(0, impl_->distance_buffer);
+    if (!bind_topk) {
+        return make_unexpected(bind_topk.error().code(), bind_topk.error().message());
+    }
+    bind_topk = impl_->topk_desc_set.bind_buffer(1, impl_->result_distances_buffer);
+    if (!bind_topk) {
+        return make_unexpected(bind_topk.error().code(), bind_topk.error().message());
+    }
+    bind_topk = impl_->topk_desc_set.bind_buffer(2, impl_->result_indices_buffer);
+    if (!bind_topk) {
+        return make_unexpected(bind_topk.error().code(), bind_topk.error().message());
+    }
+
+    // --- Record and submit the command buffer ------------------------------
     auto cmd_result = CommandBuffer::create(*impl_->ctx);
     if (!cmd_result) {
         return make_unexpected(cmd_result.error().code(), cmd_result.error().message());
     }
     auto cmd = std::move(*cmd_result);
-    cmd.barrier();
-    cmd.bind_pipeline(impl_->distance_pipeline);
-    cmd.bind_descriptor_set(impl_->distance_pipeline, impl_->distance_desc_set);
-    
-    struct PushConstants {
+    cmd.begin();
+
+    // Select distance pipeline based on metric.
+    Pipeline& distance_pipeline = (impl_->metric == Metric::IP)
+        ? impl_->distance_ip_pipeline
+        : impl_->distance_l2_pipeline;
+
+    // Pass A: compute per-vector distances.
+    cmd.bind_pipeline(distance_pipeline);
+    cmd.bind_descriptor_set(distance_pipeline, impl_->distance_desc_set);
+
+    struct DistancePushConstants {
         uint32_t n_vectors;
         uint32_t dimension;
         uint32_t query_offset;
         uint32_t pad;
-    } pc = {
+    } dpc = {
         static_cast<uint32_t>(impl_->n_vectors),
         impl_->dimension,
-        0,
-        0
+        0u,
+        0u
     };
-    
-    cmd.push_constants(impl_->distance_pipeline, &pc, sizeof(pc));
-    
-    uint32_t workgroups = (static_cast<uint32_t>(impl_->n_vectors) + 255) / 256;
-    cmd.dispatch(workgroups);
+    cmd.push_constants(distance_pipeline, &dpc, sizeof(dpc));
+
+    uint32_t dist_wg = (static_cast<uint32_t>(impl_->n_vectors) + 255u) / 256u;
+    cmd.dispatch(dist_wg);
+
+    // Barrier: distance writes must complete before top-k reads them.
+    cmd.barrier();
+
+    // Pass B: per-workgroup bitonic-sort top-k.
+    cmd.bind_pipeline(impl_->topk_pipeline);
+    cmd.bind_descriptor_set(impl_->topk_pipeline, impl_->topk_desc_set);
+
+    struct TopKPushConstants {
+        uint32_t n_vectors;
+        uint32_t k;
+        uint32_t pad0;
+        uint32_t pad1;
+    } tpc = {
+        static_cast<uint32_t>(impl_->n_vectors),
+        k,
+        0u,
+        0u
+    };
+    cmd.push_constants(impl_->topk_pipeline, &tpc, sizeof(tpc));
+    cmd.dispatch(n_topk_wg);
+
     cmd.barrier();
     cmd.end();
-    
+
     auto submit_result = submit_and_wait(*impl_->ctx, cmd);
     if (!submit_result) {
         return make_unexpected(submit_result.error().code(), submit_result.error().message());
     }
-    
-    // Download distances
-    std::vector<uint8_t> dist_bytes(impl_->n_vectors * sizeof(float));
-    auto download_result = impl_->distance_buffer.download(dist_bytes);
-    if (!download_result) {
-        return make_unexpected(download_result.error().code(), download_result.error().message());
+
+    // --- CPU merge: find global top-k from n_topk_wg * k candidates -------
+    uint32_t n_partial = n_topk_wg * k;
+    std::vector<uint8_t> dist_bytes(static_cast<uint64_t>(n_partial) * sizeof(float));
+    std::vector<uint8_t> idx_bytes(static_cast<uint64_t>(n_partial) * sizeof(uint32_t));
+
+    auto download_dist = impl_->result_distances_buffer.download(dist_bytes);
+    if (!download_dist) {
+        return make_unexpected(download_dist.error().code(), download_dist.error().message());
     }
-    
-    float* distances = reinterpret_cast<float*>(dist_bytes.data());
-    
-    std::vector<std::pair<float, uint64_t>> scored;
-    scored.reserve(impl_->n_vectors);
-    for (uint64_t i = 0; i < impl_->n_vectors; ++i) {
-        scored.emplace_back(distances[i], i);
+    auto download_idx = impl_->result_indices_buffer.download(idx_bytes);
+    if (!download_idx) {
+        return make_unexpected(download_idx.error().code(), download_idx.error().message());
     }
-    
-    uint32_t actual_k = std::min(k, static_cast<uint32_t>(impl_->n_vectors));
-    std::partial_sort(scored.begin(), scored.begin() + actual_k, scored.end(),
-                      [](const auto& a, const auto& b) { return a.first < b.first; });
-    
-    for (uint32_t i = 0; i < actual_k; ++i) {
-        results.results[i].distance = scored[i].first;
-        results.results[i].id = impl_->id_mapping[scored[i].second];
+
+    const float*    raw_dists = reinterpret_cast<const float*>(dist_bytes.data());
+    const uint32_t* raw_idxs  = reinterpret_cast<const uint32_t*>(idx_bytes.data());
+
+    // Collect valid (distance, vector_index) pairs, discarding +inf sentinels.
+    std::vector<std::pair<float, uint32_t>> candidates;
+    candidates.reserve(n_partial);
+    for (uint32_t i = 0; i < n_partial; ++i) {
+        if (raw_idxs[i] != 0xFFFFFFFFu && raw_idxs[i] < static_cast<uint32_t>(impl_->n_vectors)) {
+            candidates.emplace_back(raw_dists[i], raw_idxs[i]);
+        }
     }
-    
+
+    uint32_t actual_k = std::min(k, static_cast<uint32_t>(candidates.size()));
+    if (actual_k > 0) {
+        std::partial_sort(
+            candidates.begin(),
+            candidates.begin() + actual_k,
+            candidates.end(),
+            [](const std::pair<float,uint32_t>& a, const std::pair<float,uint32_t>& b) {
+                return a.first < b.first;
+            });
+
+        for (uint32_t i = 0; i < actual_k; ++i) {
+            results.results[i].distance = candidates[i].first;
+            results.results[i].id       = impl_->id_mapping[candidates[i].second];
+        }
+    }
+
     return results;
 }
 

@@ -9,6 +9,7 @@ file(MAKE_DIRECTORY ${SHADER_OUTPUT_DIR})
 
 set(SHADER_SOURCES
     distance_l2.comp
+    distance_ip.comp
     topk_heap.comp
 )
 

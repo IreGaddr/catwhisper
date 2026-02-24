@@ -1,125 +1,135 @@
 #version 450
-#extension GL_KHR_shader_subgroup_shuffle : enable
-#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// Per-workgroup bitonic sort top-k.
+//
+// Each workgroup processes CHUNK = 512 elements from the flat distance array.
+// It sorts them ascending in shared memory and writes the k smallest to the
+// output buffers at slot [wid*k .. (wid+1)*k - 1].
+//
+// The host then downloads all n_workgroups * k partial results and performs a
+// cheap CPU partial_sort to obtain the global top-k.
+//
+// Constraints:
+//   local_size_x == 256  (each thread owns 2 elements: tid and tid+256)
+//   CHUNK == 512         (must be a power of 2; must match TOPK_CHUNK in C++)
 
 layout(local_size_x = 256) in;
 
+// Binding 0: flat per-vector distances written by the distance shader.
 layout(set = 0, binding = 0) readonly buffer InputDistances {
     float in_distances[];
 };
 
-layout(set = 0, binding = 1) readonly buffer InputIndices {
-    uint in_indices[];
-};
-
-layout(set = 0, binding = 2) writeonly buffer OutputDistances {
+// Binding 1: output partial top-k distances (n_workgroups * k elements).
+layout(set = 0, binding = 1) buffer OutputDistances {
     float out_distances[];
 };
 
-layout(set = 0, binding = 3) writeonly buffer OutputIndices {
+// Binding 2: output partial top-k indices (n_workgroups * k elements).
+layout(set = 0, binding = 2) buffer OutputIndices {
     uint out_indices[];
 };
 
 layout(push_constant) uniform PushConstants {
     uint n_vectors;
     uint k;
-    uint n_queries;
-    uint query_idx;
+    uint pad0;
+    uint pad1;
 };
 
 struct Pair {
     float dist;
-    uint idx;
+    uint  idx;
 };
 
-shared Pair heap[256];
-shared uint heap_size;
+// CHUNK must be a power of 2.  local_size_x * 2 == CHUNK.
+const uint CHUNK = 512u;
 
-void heap_swap(uint i, uint j) {
-    Pair tmp = heap[i];
-    heap[i] = heap[j];
-    heap[j] = tmp;
-}
-
-void heapify_up(uint idx) {
-    while (idx > 0) {
-        uint parent = (idx - 1) / 2;
-        if (heap[idx].dist < heap[parent].dist) {
-            heap_swap(idx, parent);
-            idx = parent;
-        } else {
-            break;
-        }
-    }
-}
-
-void heapify_down(uint idx) {
-    while (true) {
-        uint left = 2 * idx + 1;
-        uint right = 2 * idx + 2;
-        uint smallest = idx;
-        
-        if (left < heap_size && heap[left].dist < heap[smallest].dist) {
-            smallest = left;
-        }
-        if (right < heap_size && heap[right].dist < heap[smallest].dist) {
-            smallest = right;
-        }
-        
-        if (smallest != idx) {
-            heap_swap(idx, smallest);
-            idx = smallest;
-        } else {
-            break;
-        }
-    }
-}
-
-void heap_insert(Pair p) {
-    if (heap_size < k) {
-        heap[heap_size] = p;
-        heapify_up(heap_size);
-        heap_size++;
-    } else if (p.dist > heap[0].dist) {
-        heap[0] = p;
-        heapify_down(0);
-    }
-}
+shared Pair sort_buf[CHUNK];
 
 void main() {
-    uint tid = gl_LocalInvocationID.x;
-    uint gid = gl_GlobalInvocationID.x;
-    
-    // Initialize
-    if (tid == 0) {
-        heap_size = 0;
-    }
-    heap[tid] = Pair(1.0 / 0.0, 0);  // infinity
+    uint tid  = gl_LocalInvocationID.x;   // in [0, 255]
+    uint wid  = gl_WorkGroupID.x;
+    uint base = wid * CHUNK;
+
+    // ---- 1. Initialise shared memory with +infinity sentinel ---------------
+    const float INF = uintBitsToFloat(0x7f800000u);
+    sort_buf[tid].dist        = INF;
+    sort_buf[tid].idx         = 0xFFFFFFFFu;
+    sort_buf[tid + 256u].dist = INF;
+    sort_buf[tid + 256u].idx  = 0xFFFFFFFFu;
+
     barrier();
-    
-    // Process input elements
-    // Each thread handles elements at gid, gid + stride, gid + 2*stride, ...
-    uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
-    
-    for (uint i = gid; i < n_vectors; i += stride) {
-        Pair p;
-        p.dist = in_distances[i];
-        p.idx = i;
-        
-        // Only one thread at a time can modify heap
-        for (uint j = 0; j < gl_WorkGroupSize.x; ++j) {
-            if (tid == j) {
-                heap_insert(p);
-            }
+
+    // ---- 2. Load up to CHUNK distances into shared memory -----------------
+    // Indices are computed inline so no separate index buffer is required.
+    uint pos0 = base + tid;
+    uint pos1 = base + tid + 256u;
+
+    if (pos0 < n_vectors) {
+        sort_buf[tid].dist = in_distances[pos0];
+        sort_buf[tid].idx  = pos0;
+    }
+    if (pos1 < n_vectors) {
+        sort_buf[tid + 256u].dist = in_distances[pos1];
+        sort_buf[tid + 256u].idx  = pos1;
+    }
+
+    barrier();
+
+    // ---- 3. Ascending bitonic sort on CHUNK elements using 256 threads -----
+    //
+    // Standard Knuth / GPU bitonic sort network.  At each (bs, stride) step
+    // thread `tid` drives exactly one compare-swap pair (i, ixj):
+    //
+    //   i   = (tid & ~(stride-1)) * 2  +  (tid & (stride-1))
+    //   ixj = i | stride
+    //
+    // Because i & stride == 0 by construction, i|stride == i^stride (the XOR
+    // form used in many references).
+    //
+    // Direction:  ascending  when (i & bs) == 0
+    //             descending when (i & bs) != 0
+    //
+    // This creates alternating monotone sub-sequences; the final merge
+    // (bs == CHUNK, always ascending) produces a fully sorted result.
+    //
+    // Swap condition (handles both directions uniformly):
+    //   (sort_buf[i].dist > sort_buf[ixj].dist) == ascending
+    //
+    // Padding elements are +infinity so they naturally sink to the end.
+
+    for (uint bs = 2u; bs <= CHUNK; bs <<= 1u) {
+        for (uint stride = bs >> 1u; stride >= 1u; stride >>= 1u) {
+            // Barrier ensures all writes from the previous step are visible
+            // before any thread reads in the current step.
             barrier();
+
+            uint i   = (tid & ~(stride - 1u)) * 2u + (tid & (stride - 1u));
+            uint ixj = i | stride;
+
+            bool ascending = ((i & bs) == 0u);
+            bool need_swap = (sort_buf[i].dist > sort_buf[ixj].dist) == ascending;
+
+            if (need_swap) {
+                Pair tmp      = sort_buf[i];
+                sort_buf[i]   = sort_buf[ixj];
+                sort_buf[ixj] = tmp;
+            }
         }
     }
-    
+
+    // Final barrier: ensure all threads have finished their last swap before
+    // any thread reads the sorted results below.
     barrier();
-    
-    // Write results - output heap contents
-    if (tid < heap_size && tid < k) {
-        out_distances[query_idx * k + tid] = heap[tid].dist;
-        out_indices[query_idx * k + tid] = heap[tid].idx;
+
+    // ---- 4. Write top-k results from the sorted shared memory -------------
+    // sort_buf[0] holds the element with the smallest distance in this
+    // workgroup's slice.  Elements [0, k-1] are the k nearest neighbours
+    // within this workgroup (or +infinity if fewer than k real elements).
+    uint out_base = wid * k;
+    for (uint i = tid; i < k; i += 256u) {
+        out_distances[out_base + i] = sort_buf[i].dist;
+        out_indices[out_base + i]   = sort_buf[i].idx;
     }
 }
