@@ -29,6 +29,18 @@ IndexIVFFlat recall@10, clustered data, nprobe=16:
 | 100K × 128    | 0.964 ms   | 98.0% |
 | 100K × 256    | 0.346 ms   | 100.0% |
 
+### IVF-PQ Performance
+
+IndexIVFPQ with memory compression (m=16 subquantizers, 8 bits each):
+
+| Configuration | Median | Recall@10 | GPU Memory | Compression |
+|---------------|--------|-----------|------------|-------------|
+| 10K × 128     | 0.58 ms | 77.0% | 0.02 MB | 488x |
+| 100K × 128    | 0.90 ms | 97.0% | 0.15 MB | 488x |
+| 1M × 128      | - | - | 0.25 MB | **976x** |
+
+Memory comparison: IndexFlat (1M×128 fp16) = 244 MB vs IndexIVFPQ = 0.25 MB
+
 ## Quick Start
 
 ```cpp
@@ -70,6 +82,32 @@ index.train(train_data, 50'000).value();
 index.add(data, 1'000'000).value();
 
 // Search — 98-100% recall at 16 nprobe
+auto results = index.search({query.data(), 128}, 10).value();
+```
+
+### IVF-PQ (Product Quantization) Index
+
+For memory-constrained applications with extreme compression:
+
+```cpp
+#include <catwhisper/index_ivf_pq.hpp>
+
+auto ctx = cw::Context::create().value();
+
+// Configure IVF-PQ: 64 clusters, 32 nprobe, 16 subquantizers
+cw::IVFPQParams params{
+    .ivf = {.nlist = 64, .nprobe = 32},
+    .pq = {.m = 16, .nbits = 8}
+};
+auto index = cw::IndexIVFPQ::create(ctx, 128, params).value();
+
+// Train on representative data
+index.train(train_data, 50'000).value();
+
+// Add vectors — achieves ~976x compression
+index.add(data, 1'000'000).value();
+
+// Search — 77-97% recall with AVX-optimized re-ranking
 auto results = index.search({query.data(), 128}, 10).value();
 ```
 
@@ -118,14 +156,14 @@ unchanged.
 
 ## Status
 
-**Alpha.** IndexFlat and IndexIVFFlat are complete and production-tested.
-IndexIVFPQ and IndexHNSW are on the roadmap; see [ROADMAP](docs/ROADMAP.md).
+**Alpha.** IndexFlat, IndexIVFFlat, and IndexIVFPQ are complete and tested.
+IndexHNSW is on the roadmap; see [ROADMAP](docs/ROADMAP.md).
 
 | Index | Status |
 |-------|--------|
 | IndexFlat | ✅ Complete — beats FAISS-GPU |
 | IndexIVFFlat | ✅ Complete — 98-100% recall, GPU-accelerated |
-| IndexIVFPQ | ❌ Not started |
+| IndexIVFPQ | ✅ Complete — 976x compression, GPU ADC + AVX re-ranking |
 | IndexHNSW | ❌ Not started |
 
-59 unit tests + 7 performance budget tests passing.
+77+ unit tests + 11 performance budget tests passing.
