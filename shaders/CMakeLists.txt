@@ -17,6 +17,7 @@ set(SHADER_SOURCES
     soa_repack.comp
     ivf_distance.comp
     assign_clusters.comp
+    pq_distance.comp
 )
 
 set(SHADER_OUTPUTS "")

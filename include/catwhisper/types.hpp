@@ -57,6 +57,16 @@ struct IVFParams {
     uint32_t kmeans_iters = 20;  // K-means iterations for training
 };
 
+struct PQParams {
+    uint32_t m = 8;          // Number of subquantizers (dimension must be divisible by m)
+    uint32_t nbits = 8;      // Bits per subquantizer code (8 = 256 centroids per subquantizer)
+};
+
+struct IVFPQParams {
+    IVFParams ivf;
+    PQParams pq;
+};
+
 struct DeviceInfo {
     uint32_t device_id = 0;
     std::string name;

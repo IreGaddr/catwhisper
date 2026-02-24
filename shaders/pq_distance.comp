@@ -1,0 +1,196 @@
+#version 450
+
+// PQ Distance Computation using Asymmetric Distance Computation (ADC)
+// ONE workgroup searches ONE cluster
+//
+// ADC: precompute distance from query subvector to all codebook entries,
+// then for each PQ-encoded vector, sum up looked-up distances.
+//
+// Layout:
+// - distance_tables: nprobe * m * 256 floats (precomputed on host)
+// - pq_codes: n_vectors * m bytes (one uint8 per subquantizer)
+// - cluster_info: (start_offset, size, output_slot, pad)
+
+layout(local_size_x = 128) in;
+
+layout(binding = 0) buffer DistanceTables {
+    float distance_tables[];  // [nprobe][m][256] - distance from query to all centroids
+};
+
+layout(binding = 1) buffer PQCodes {
+    uint pq_codes[];  // Packed PQ codes, 4 codes per uint (little endian)
+};
+
+layout(binding = 2) buffer ClusterInfo {
+    uvec4 cluster_info[];  // (start_offset, size, output_slot, pad)
+};
+
+layout(binding = 3) buffer OutDistances {
+    float out_distances[];
+};
+
+layout(binding = 4) buffer OutIndices {
+    uint out_indices[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint m;             // Number of subquantizers
+    uint k;             // Number of results to return
+    uint metric;        // 0 = L2, 1 = IP
+    uint nprobe;        // Number of clusters probed
+} pc;
+
+// Per-thread local top-k (max k=32)
+shared float local_dist[128 * 32];
+shared uint local_idx[128 * 32];
+
+// Merge buffer for final bitonic sort
+shared float merge_dist[4096];
+shared uint merge_idx[4096];
+
+// Insert into max-heap of size k
+void heap_insert(uint base, float d, uint idx, uint k) {
+    if (d >= local_dist[base + 0u]) return;
+
+    local_dist[base + 0u] = d;
+    local_idx[base + 0u] = idx;
+
+    uint pos = 0u;
+    for (int level = 0; level < 6; ++level) {
+        uint left = 2u * pos + 1u;
+        uint right = 2u * pos + 2u;
+        uint largest = pos;
+        if (left < k && local_dist[base + left] > local_dist[base + largest]) largest = left;
+        if (right < k && local_dist[base + right] > local_dist[base + largest]) largest = right;
+        if (largest == pos) break;
+
+        float td = local_dist[base + pos];
+        local_dist[base + pos] = local_dist[base + largest];
+        local_dist[base + largest] = td;
+
+        uint ti = local_idx[base + pos];
+        local_idx[base + pos] = local_idx[base + largest];
+        local_idx[base + largest] = ti;
+
+        pos = largest;
+    }
+}
+
+// Extract byte from packed uint (little endian: byte 0 = LSB)
+uint extract_code(uint packed, uint byte_idx) {
+    return (packed >> (byte_idx * 8u)) & 0xFFu;
+}
+
+// Get PQ code for vector at position vec_idx, subquantizer sub_idx
+uint get_pq_code(uint vec_idx, uint sub_idx) {
+    // 4 codes packed per uint
+    uint word_idx = (vec_idx * pc.m + sub_idx) / 4u;
+    uint byte_idx = (vec_idx * pc.m + sub_idx) % 4u;
+    return extract_code(pq_codes[word_idx], byte_idx);
+}
+
+// Compute ADC distance for a single vector
+float compute_adc_distance(uint vec_idx, uint nprobe_slot) {
+    float sum = 0.0f;
+
+    // Each subquantizer contributes to the distance
+    for (uint sub = 0u; sub < pc.m; ++sub) {
+        uint code = get_pq_code(vec_idx, sub);
+        // Distance table layout: [nprobe_slot][sub][code]
+        uint table_idx = nprobe_slot * pc.m * 256u + sub * 256u + code;
+        sum += distance_tables[table_idx];
+    }
+
+    return sum;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wid = gl_WorkGroupID.x;
+
+    uvec4 info = cluster_info[wid];
+    uint cluster_start = info.x;      // Start position in pq_codes
+    uint cluster_size = info.y;
+    uint output_slot = info.z;
+    uint nprobe_slot = output_slot;   // Map cluster to distance table slot
+
+    const float INF = uintBitsToFloat(0x7f800000u);
+    uint base = tid * 16u;
+
+    // Phase 1: Each thread processes its assigned vectors, maintaining local top-k
+    uint vecs_per_thread = (cluster_size + 127u) / 128u;
+
+    for (uint v = 0u; v < vecs_per_thread; ++v) {
+        uint local_pos = tid + v * 128u;
+        if (local_pos >= cluster_size) break;
+
+        if (v == 0) {
+            for (uint i = 0u; i < pc.k; ++i) {
+                local_dist[base + i] = INF;
+                local_idx[base + i] = 0xFFFFFFFFu;
+            }
+        }
+        uint vec_idx = cluster_start + local_pos;
+        float dist = compute_adc_distance(vec_idx, nprobe_slot);
+
+        heap_insert(base, dist, local_pos, pc.k);
+    }
+
+    barrier();
+
+    // If thread didn't process any vector (cluster_size < 128)
+    if (vecs_per_thread == 0 || tid >= cluster_size) {
+        for (uint i = 0u; i < pc.k; ++i) {
+            local_dist[base + i] = INF;
+            local_idx[base + i] = 0xFFFFFFFFu;
+        }
+    }
+    // Phase 2: Collect top candidates from ALL 128 threads into merge buffer
+    if (tid < 128u) {
+        for (uint i = 0u; i < pc.k; ++i) {
+            uint dst = tid * pc.k + i;
+            merge_dist[dst] = local_dist[tid * 16u + i];
+            merge_idx[dst] = local_idx[tid * 16u + i];
+        }
+    }
+    // Fill remaining slots with INF
+    if (tid < 64u) {
+        uint start = 128u * pc.k;
+        for (uint i = tid * 16u; i < (tid + 1u) * 16u && start + i < 4096u; ++i) {
+            merge_dist[start + i] = INF;
+            merge_idx[start + i] = 0xFFFFFFFFu;
+        }
+    }
+    barrier();
+
+    // Phase 3: Bitonic sort merge buffer (4096 elements, ascending)
+    for (uint bs = 2u; bs <= 4096u; bs <<= 1u) {
+        for (uint stride = bs >> 1u; stride >= 1u; stride >>= 1u) {
+            barrier();
+
+            for (uint j = 0u; j < 16u; ++j) {
+                uint ci = tid * 16u + j;
+                uint i = (ci & ~(stride - 1u)) * 2u + (ci & (stride - 1u));
+                uint ixj = i | stride;
+
+                if (ixj < 4096u) {
+                    bool ascending = ((i & bs) == 0u);
+                    bool need_swap = (merge_dist[i] > merge_dist[ixj]) == ascending;
+
+                    if (need_swap) {
+                        float td = merge_dist[i]; merge_dist[i] = merge_dist[ixj]; merge_dist[ixj] = td;
+                        uint ti = merge_idx[i]; merge_idx[i] = merge_idx[ixj]; merge_idx[ixj] = ti;
+                    }
+                }
+            }
+        }
+    }
+    barrier();
+
+    // Phase 4: Write top-k results
+    if (tid < pc.k) {
+        uint out_base = output_slot * pc.k;
+        out_distances[out_base + tid] = merge_dist[tid];
+        out_indices[out_base + tid] = merge_idx[tid];
+    }
+}
