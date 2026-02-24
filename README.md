@@ -96,16 +96,3 @@ and IndexHNSW are on the roadmap; see [ROADMAP](docs/ROADMAP.md).
 | IndexHNSW | ❌ Not started |
 
 41 unit tests + 3 performance budget tests passing.
-
-## Architecture
-
-- [Architecture Overview](docs/ARCHITECTURE.md)
-- [GPU Compute Pipeline](docs/GPU_COMPUTE.md)
-- [Data Structures & Algorithms](docs/DATA_STRUCTURES.md)
-- [API Design](docs/API_DESIGN.md)
-- [Build System](docs/BUILD_SYSTEM.md)
-- [Development Roadmap](docs/ROADMAP.md)
-
-## License
-
-MIT or Apache 2.0 (dual-licensed).
