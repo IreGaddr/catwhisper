@@ -55,7 +55,7 @@ Tests are written first and are contractually immutable: they may never be
 weakened to accommodate a lagging implementation.  This asymmetry forces
 genuine optimization rather than satisficing, and provides AI-agent optimizers
 with a binary, reproducible oracle.  We demonstrate ROTRTA on CatWhisper, a
-cross-vendor GPU vector similarity search library built on Vulkan.  Starting
+cross-vendor GPU vector similarity query library built on Vulkan.  Starting
 from a manually optimized baseline that remained \SI{2.4}{\times} slower than
 FAISS-GPU across three benchmark configurations, a single ROTRTA session
 driven by an autonomous AI agent produced a stack of six coordinated
@@ -72,7 +72,7 @@ problem.
 \end{abstract}
 
 \begin{IEEEkeywords}
-test-driven development, performance engineering, vector similarity search,
+test-driven development, performance engineering, vector similarity query,
 GPU computing, Vulkan, FAISS, AI agents, benchmark-driven optimization
 \end{IEEEkeywords}
 
@@ -270,7 +270,7 @@ means an agent cannot exit the optimization loop by rationalizing that
 \section{CatWhisper: System Design and Contrast with FAISS}
 \label{sec:catwhisper}
 
-CatWhisper is a C++ GPU vector similarity search library targeting
+CatWhisper is a C++ GPU vector similarity query library targeting
 production use.  Its primary design axis --- cross-vendor Vulkan compute
 rather than CUDA --- leads to a set of architectural decisions that differ
 materially from FAISS, and which constitute both constraints and opportunities
@@ -905,7 +905,7 @@ We have presented ROTRTA, a methodology for test-driven performance
 engineering in which latency assertions are anchored to state-of-the-art
 reference systems and are contractually immutable once written.  We have
 demonstrated ROTRTA on CatWhisper, a cross-vendor Vulkan GPU vector
-similarity search library, achieving a \SI{17.7}{\times}--\SI{67.1}{\times}
+similarity query library, achieving a \SI{17.7}{\times}--\SI{67.1}{\times}
 total speedup over the initial implementation and causing CatWhisper to
 outperform FAISS-GPU --- the industry standard --- by 1.2$\times$ to 6.3$\times$
 on three benchmark configurations.

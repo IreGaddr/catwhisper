@@ -2,7 +2,7 @@
 
 ## Vision
 
-CatWhisper aims to be a production-ready, high-performance vector similarity search library that:
+CatWhisper aims to be a production-ready, high-performance vector similarity query library that:
 - Provides a vendor-neutral alternative to FAISS
 - Achieves 80-100% of FAISS performance on equivalent hardware
 - Supports all major GPU vendors through Vulkan

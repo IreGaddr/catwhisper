@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 project(catwhisper
     VERSION 0.1.0
-    DESCRIPTION "GPU-accelerated vector similarity search library"
+    DESCRIPTION "GPU-accelerated vector similarity query library"
     LANGUAGES CXX
 )
 

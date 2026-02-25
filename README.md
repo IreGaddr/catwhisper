@@ -1,6 +1,6 @@
 # CatWhisper
 
-**Cross-vendor GPU vector similarity search — faster than FAISS-GPU**
+**Cross-vendor GPU vector similarity query — faster than FAISS-GPU**
 
 CatWhisper is a C++ library for exact and approximate nearest neighbor search
 over dense vectors, accelerated via Vulkan compute shaders.  It runs on any
@@ -175,4 +175,4 @@ See [ROADMAP](docs/ROADMAP.md) for details.
 | IndexIVFPQ | ✅ Complete — 976x compression, GPU ADC + AVX re-ranking |
 | IndexHNSW | ✅ Complete — CPU graph search, 90% recall @ 0.36ms |
 
-88 unit tests + 14 performance budget tests passing.
+102 tests passing.
