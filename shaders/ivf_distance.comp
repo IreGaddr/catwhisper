@@ -125,11 +125,17 @@ void main() {
         }
     }
     // Fill remaining slots with INF (128*k to 2048)
-    if (tid < 64u) {
+    // Use all 128 threads to ensure complete coverage
+    {
         uint start = 128u * pc.k;
-        for (uint i = tid * 16u; i < (tid + 1u) * 16u && start + i < 2048u; ++i) {
-            merge_dist[start + i] = INF;
-            merge_idx[start + i] = 0xFFFFFFFFu;
+        uint remaining = 2048u - start;
+        uint per_thread = (remaining + 127u) / 128u;
+        for (uint j = 0u; j < per_thread; ++j) {
+            uint idx = start + tid * per_thread + j;
+            if (idx < 2048u) {
+                merge_dist[idx] = INF;
+                merge_idx[idx] = 0xFFFFFFFFu;
+            }
         }
     }
     barrier();
@@ -156,6 +162,8 @@ void main() {
             }
         }
     }
+    barrier();
+
     barrier();
 
     // Phase 4: Write top-k results

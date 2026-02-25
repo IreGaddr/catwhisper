@@ -10,6 +10,8 @@
 #include <catwhisper/index.hpp>
 #include <catwhisper/index_flat.hpp>
 #include <catwhisper/index_ivf_flat.hpp>
+#include <catwhisper/index_ivf_pq.hpp>
+#include <catwhisper/index_hnsw.hpp>
 #include <catwhisper/distance.hpp>
 
 namespace catwhisper = cw;

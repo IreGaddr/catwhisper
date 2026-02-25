@@ -1,0 +1,130 @@
+======================================================================
+FAISS Benchmark (Clustered Data for IVF/PQ/HNSW)
+======================================================================
+FAISS version : 1.13.2
+GPU support   : YES
+Warmup queries: 20
+Bench queries : 200
+
+----------------------------------------------------------------------
+Config: 10K  x128  k=10
+
+  [IndexFlatL2] (random data)
+    CPU:  median 0.059 ms, mean 0.065 ms, QPS 15452
+    GPU:  median 0.050 ms, mean 0.052 ms, QPS 19247
+
+  [IndexIVFFlat] nlist=32, nprobe=16 (clustered data)
+    CPU:  median 0.058 ms, QPS 17155, recall 100.0%
+    GPU:  median 0.100 ms, QPS 8296, recall 100.0%
+
+  [IndexIVFPQ] nlist=32, nprobe=16, m=16 (clustered data)
+    CPU:  median 0.077 ms, QPS 12933, recall 25.0%
+    GPU:  median 0.088 ms, QPS 11358, recall 25.0%
+
+  [IndexHNSW] M=16 (clustered data, CPU only)
+    CPU ef=10: median 0.008 ms, QPS 129261, recall 50.0%
+    CPU ef=50: median 0.017 ms, QPS 59143, recall 87.0%
+    CPU ef=100: median 0.025 ms, QPS 39801, recall 90.0%
+
+----------------------------------------------------------------------
+Config: 100K x128  k=10
+
+  [IndexFlatL2] (random data)
+    CPU:  median 1.059 ms, mean 1.060 ms, QPS 943
+    GPU:  median 0.323 ms, mean 0.453 ms, QPS 2209
+
+  [IndexIVFFlat] nlist=64, nprobe=16 (clustered data)
+    CPU:  median 0.448 ms, QPS 2195, recall 100.0%
+    GPU:  median 0.426 ms, QPS 2303, recall 100.0%
+
+  [IndexIVFPQ] nlist=64, nprobe=16, m=16 (clustered data)
+    CPU:  median 0.495 ms, QPS 2015, recall 4.0%
+    GPU:  median 0.117 ms, QPS 7670, recall 0.0%
+
+  [IndexHNSW] M=16 (clustered data, CPU only)
+    CPU ef=10: median 0.010 ms, QPS 87487, recall 33.0%
+    CPU ef=50: median 0.032 ms, QPS 25991, recall 49.0%
+    CPU ef=100: median 0.053 ms, QPS 17519, recall 64.0%
+
+----------------------------------------------------------------------
+Config: 100K x256  k=10
+
+  [IndexFlatL2] (random data)
+    CPU:  median 1.858 ms, mean 1.919 ms, QPS 521
+    GPU:  median 0.527 ms, mean 0.539 ms, QPS 1855
+
+  [IndexIVFFlat] nlist=64, nprobe=16 (clustered data)
+    CPU:  median 0.855 ms, QPS 1157, recall 100.0%
+    GPU:  median 0.594 ms, QPS 1632, recall 100.0%
+
+  [IndexIVFPQ] nlist=64, nprobe=16, m=16 (clustered data)
+    CPU:  median 0.472 ms, QPS 2122, recall 29.0%
+    GPU:  median 0.102 ms, QPS 9061, recall 29.0%
+
+  [IndexHNSW] M=16 (clustered data, CPU only)
+    CPU ef=10: median 0.014 ms, QPS 70379, recall 28.0%
+    CPU ef=50: median 0.035 ms, QPS 27826, recall 58.0%
+    CPU ef=100: median 0.057 ms, QPS 17043, recall 65.0%
+
+======================================================================
+SUMMARY
+======================================================================
+Config         Backend                    Median      QPS  Recall
+----------------------------------------------------------------------
+10K  x128      faiss-cpu-flat              0.059    15452       -
+10K  x128      faiss-gpu-flat              0.050    19247       -
+10K  x128      faiss-cpu-ivf               0.058    17155  100.0%
+10K  x128      faiss-gpu-ivf               0.100     8296  100.0%
+10K  x128      faiss-cpu-pq                0.077    12933   25.0%
+10K  x128      faiss-gpu-pq                0.088    11358   25.0%
+10K  x128      faiss-cpu-hnsw-ef10         0.008   129261   50.0%
+10K  x128      faiss-cpu-hnsw-ef50         0.017    59143   87.0%
+10K  x128      faiss-cpu-hnsw-ef100        0.025    39801   90.0%
+100K x128      faiss-cpu-flat              1.059      943       -
+100K x128      faiss-gpu-flat              0.323     2209       -
+100K x128      faiss-cpu-ivf               0.448     2195  100.0%
+100K x128      faiss-gpu-ivf               0.426     2303  100.0%
+100K x128      faiss-cpu-pq                0.495     2015    4.0%
+100K x128      faiss-gpu-pq                0.117     7670    0.0%
+100K x128      faiss-cpu-hnsw-ef10         0.010    87487   33.0%
+100K x128      faiss-cpu-hnsw-ef50         0.032    25991   49.0%
+100K x128      faiss-cpu-hnsw-ef100        0.053    17519   64.0%
+100K x256      faiss-cpu-flat              1.858      521       -
+100K x256      faiss-gpu-flat              0.527     1855       -
+100K x256      faiss-cpu-ivf               0.855     1157  100.0%
+100K x256      faiss-gpu-ivf               0.594     1632  100.0%
+100K x256      faiss-cpu-pq                0.472     2122   29.0%
+100K x256      faiss-gpu-pq                0.102     9061   29.0%
+100K x256      faiss-cpu-hnsw-ef10         0.014    70379   28.0%
+100K x256      faiss-cpu-hnsw-ef50         0.035    27826   58.0%
+100K x256      faiss-cpu-hnsw-ef100        0.057    17043   65.0%
+
+# BENCHMARK_DATA_BEGIN
+DATA|10K  x128|faiss-cpu-flat|0.0647|0.0588|0.0748|0.2385|15451.67|-1.0000
+DATA|10K  x128|faiss-gpu-flat|0.0520|0.0504|0.0585|0.0620|19246.93|-1.0000
+DATA|10K  x128|faiss-cpu-ivf|0.0583|0.0578|0.0615|0.0755|17155.04|1.0000
+DATA|10K  x128|faiss-gpu-ivf|0.1205|0.1004|0.2145|0.6587|8295.85|1.0000
+DATA|10K  x128|faiss-cpu-pq|0.0773|0.0771|0.0807|0.0825|12933.21|0.2500
+DATA|10K  x128|faiss-gpu-pq|0.0880|0.0878|0.0913|0.0993|11358.08|0.2500
+DATA|10K  x128|faiss-cpu-hnsw-ef10|0.0077|0.0076|0.0086|0.0121|129260.74|0.5000
+DATA|10K  x128|faiss-cpu-hnsw-ef50|0.0169|0.0167|0.0181|0.0211|59143.29|0.8700
+DATA|10K  x128|faiss-cpu-hnsw-ef100|0.0251|0.0250|0.0262|0.0290|39801.11|0.9000
+DATA|100K x128|faiss-cpu-flat|1.0604|1.0594|1.1870|1.2453|943.07|-1.0000
+DATA|100K x128|faiss-gpu-flat|0.4527|0.3229|0.8305|0.8423|2209.04|-1.0000
+DATA|100K x128|faiss-cpu-ivf|0.4556|0.4484|0.5064|0.6191|2195.01|1.0000
+DATA|100K x128|faiss-gpu-ivf|0.4342|0.4257|0.4339|0.8319|2303.35|1.0000
+DATA|100K x128|faiss-cpu-pq|0.4962|0.4949|0.5082|0.5381|2015.24|0.0400
+DATA|100K x128|faiss-gpu-pq|0.1304|0.1173|0.1265|0.6312|7669.76|0.0000
+DATA|100K x128|faiss-cpu-hnsw-ef10|0.0114|0.0103|0.0186|0.0240|87487.19|0.3300
+DATA|100K x128|faiss-cpu-hnsw-ef50|0.0385|0.0316|0.0396|0.3507|25990.86|0.4900
+DATA|100K x128|faiss-cpu-hnsw-ef100|0.0571|0.0525|0.1029|0.1348|17518.51|0.6400
+DATA|100K x256|faiss-cpu-flat|1.9187|1.8582|2.1949|2.5472|521.18|-1.0000
+DATA|100K x256|faiss-gpu-flat|0.5390|0.5272|0.5479|0.9606|1855.19|-1.0000
+DATA|100K x256|faiss-cpu-ivf|0.8646|0.8550|0.9377|1.1803|1156.58|1.0000
+DATA|100K x256|faiss-gpu-ivf|0.6126|0.5935|0.6480|1.2831|1632.49|1.0000
+DATA|100K x256|faiss-cpu-pq|0.4712|0.4724|0.4814|0.4986|2122.37|0.2900
+DATA|100K x256|faiss-gpu-pq|0.1104|0.1020|0.1181|0.5479|9061.20|0.2900
+DATA|100K x256|faiss-cpu-hnsw-ef10|0.0142|0.0138|0.0176|0.0272|70379.29|0.2800
+DATA|100K x256|faiss-cpu-hnsw-ef50|0.0359|0.0346|0.0401|0.1054|27825.72|0.5800
+DATA|100K x256|faiss-cpu-hnsw-ef100|0.0587|0.0574|0.0637|0.1383|17042.97|0.6500
+# BENCHMARK_DATA_END

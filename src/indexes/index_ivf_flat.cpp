@@ -9,6 +9,7 @@
 #include <cmath>
 #include <random>
 #include <limits>
+#include <iostream>
 
 namespace cw {
 
@@ -621,7 +622,7 @@ Expected<SearchResults> IndexIVFFlat::search(Vector query, uint32_t k) {
             mapped[p * 4 + 0] = impl_->cluster_soa_offsets[cluster];  // SoA offset in fp16 units
             mapped[p * 4 + 1] = impl_->cluster_offsets[cluster + 1] - impl_->cluster_offsets[cluster];  // size
             mapped[p * 4 + 2] = p;  // output_slot
-            mapped[p * 4 + 3] = cluster;  // Store actual cluster ID for index conversion
+            mapped[p * 4 + 3] = cluster;
         }
     }
 
@@ -715,10 +716,11 @@ Expected<SearchResults> IndexIVFFlat::search(Vector query, uint32_t k) {
     all_results.reserve(nprobe * k);
     for (uint32_t p = 0; p < nprobe; ++p) {
         uint32_t cluster = selected_clusters[p];
-        uint32_t cluster_start = impl_->cluster_offsets[cluster];  // Start in flat_ids
+        uint32_t cluster_start = impl_->cluster_offsets[cluster];
+        uint32_t cluster_size = impl_->cluster_offsets[cluster + 1] - impl_->cluster_offsets[cluster];
         for (uint32_t i = 0; i < k; ++i) {
             uint32_t local_pos = idxs[p * k + i];
-            if (local_pos != 0xFFFFFFFFu && local_pos < impl_->cluster_offsets[cluster + 1] - impl_->cluster_offsets[cluster]) {
+            if (local_pos != 0xFFFFFFFFu && local_pos < cluster_size) {
                 uint32_t global_idx = cluster_start + local_pos;
                 all_results.emplace_back(dists[p * k + i], global_idx);
             }

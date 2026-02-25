@@ -4,15 +4,15 @@ Parse the DATA| lines from bench_faiss.py and the CatWhisper benchmark
 binary and print a side-by-side comparison table.
 
 Usage:
-    python compare.py catwhisper.txt faiss.txt
+    python compare.py catwhisper.txt faiss.txt [--index TYPE]
 
 Each input file is the captured stdout of the respective benchmark.
 DATA lines have the format:
-    DATA|<label>|<backend>|<mean_ms>|<median_ms>|<p95_ms>|<p99_ms>|<qps>
+    DATA|<label>|<backend>|<mean_ms>|<median_ms>|<p95_ms>|<p99_ms>|<qps>|<recall>
 """
 
 import sys
-import re
+import argparse
 from collections import defaultdict
 
 
@@ -24,9 +24,10 @@ def parse_file(path: str) -> list[dict]:
             if not line.startswith("DATA|"):
                 continue
             parts = line.split("|")
-            if len(parts) != 8:
+            if len(parts) < 8:
                 continue
-            _, label, backend, mean, median, p95, p99, qps = parts
+            _, label, backend, mean, median, p95, p99, qps = parts[:9]
+            recall = float(parts[8]) if len(parts) > 8 else -1.0
             rows.append(dict(
                 label   = label.strip(),
                 backend = backend.strip(),
@@ -35,82 +36,132 @@ def parse_file(path: str) -> list[dict]:
                 p95     = float(p95),
                 p99     = float(p99),
                 qps     = float(qps),
+                recall  = recall,
             ))
     return rows
 
 
+def detect_index_type(backend: str) -> str:
+    """Detect index type from backend name."""
+    backend_lower = backend.lower()
+    if "hnsw" in backend_lower:
+        return "hnsw"
+    elif "pq" in backend_lower:
+        return "pq"
+    elif "ivf" in backend_lower:
+        return "ivf"
+    else:
+        return "flat"
+
+
 def main():
-    if len(sys.argv) != 3:
-        print("Usage: compare.py <catwhisper_output.txt> <faiss_output.txt>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("catwhisper_file", help="CatWhisper benchmark output")
+    parser.add_argument("faiss_file", help="FAISS benchmark output")
+    parser.add_argument("--index", choices=["flat", "ivf", "pq", "hnsw", "all"],
+                        default="all", help="Compare specific index type")
+    args = parser.parse_args()
 
-    cw_rows    = parse_file(sys.argv[1])
-    faiss_rows = parse_file(sys.argv[2])
+    cw_rows    = parse_file(args.catwhisper_file)
+    faiss_rows = parse_file(args.faiss_file)
 
-    # Index by (label, mode) where mode = single|batch
+    # Index by (label, index_type, mode)
     def key(row):
         backend = row["backend"]
+        index_type = detect_index_type(backend)
         if "single" in backend:
-            return (row["label"], "single")
-        if "batch" in backend:
-            return (row["label"], "batch")
-        return (row["label"], backend)
+            mode = "single"
+        elif "batch" in backend:
+            mode = "batch"
+        else:
+            mode = "single"
+        return (row["label"], index_type, mode)
 
-    cw_map    = {key(r): r for r in cw_rows}
-    faiss_map = defaultdict(dict)
+    cw_map = {key(r): r for r in cw_rows}
+    faiss_map = defaultdict(lambda: defaultdict(dict))
     for r in faiss_rows:
         k = key(r)
-        tag = "gpu" if "gpu" in r["backend"] else "cpu"
-        faiss_map[k][tag] = r
+        tag = "gpu" if "gpu" in r["backend"].lower() else "cpu"
+        faiss_map[k[:2]][tag][r["backend"]] = r  # key by (label, index_type)
 
     configs = sorted({r["label"] for r in cw_rows + faiss_rows})
-    modes   = ["single", "batch"]
+    index_types = ["flat", "ivf", "pq", "hnsw"] if args.index == "all" else [args.index]
 
-    print("=" * 90)
-    print("CatWhisper vs FAISS — mean latency (ms) / QPS   [lower ms = better]")
-    print("=" * 90)
+    print("=" * 100)
+    print("CatWhisper vs FAISS — latency (ms) / QPS / Recall   [lower ms = better, higher recall = better]")
+    print("=" * 100)
 
-    header = f"{'Config':<14} {'Mode':<7}  {'CW fp16 ms':>12} {'CW fp16 QPS':>12}  {'FAISS-GPU ms':>13} {'FAISS-GPU QPS':>14}  {'Ratio CW/GPU':>13}"
-    print(header)
-    print("-" * 90)
+    for idx_type in index_types:
+        print(f"\n--- {idx_type.upper()} ---")
 
-    for cfg in configs:
-        for mode in modes:
-            k = (cfg, mode)
-            cw  = cw_map.get(k)
-            fgpu = faiss_map.get(k, {}).get("gpu")
-            fcpu = faiss_map.get(k, {}).get("cpu")
+        header = f"{'Config':<14} {'CW ms':>8} {'CW QPS':>8} {'CW Rec':>7}  {'FAISS-GPU ms':>12} {'GPU QPS':>8} {'GPU Rec':>7}  {'FAISS-CPU ms':>12} {'CPU QPS':>8} {'CPU Rec':>7}"
+        print(header)
+        print("-" * 100)
 
-            if cw is None and fgpu is None:
-                continue
+        for cfg in configs:
+            k = (cfg, idx_type)
+            faiss_by_backend = faiss_map.get(k, {})
 
-            cw_ms  = f"{cw['mean']:>12.3f}"  if cw   else f"{'N/A':>12}"
-            cw_qps = f"{cw['qps']:>12.1f}"   if cw   else f"{'N/A':>12}"
-            fg_ms  = f"{fgpu['mean']:>13.3f}" if fgpu else f"{'N/A':>13}"
-            fg_qps = f"{fgpu['qps']:>14.1f}"  if fgpu else f"{'N/A':>14}"
+            # Get best FAISS-GPU and FAISS-CPU for this config
+            faiss_gpu = None
+            faiss_cpu = None
 
-            if cw and fgpu:
-                ratio = cw["mean"] / fgpu["mean"]
-                ratio_s = f"{ratio:>12.2f}x"
-            else:
-                ratio_s = f"{'N/A':>13}"
+            for backend, row in faiss_by_backend.get("gpu", {}).items():
+                if faiss_gpu is None or row["mean"] < faiss_gpu["mean"]:
+                    faiss_gpu = row
 
-            print(f"{cfg:<14} {mode:<7}  {cw_ms} {cw_qps}  {fg_ms} {fg_qps}  {ratio_s}")
+            for backend, row in faiss_by_backend.get("cpu", {}).items():
+                if faiss_cpu is None or row["mean"] < faiss_cpu["mean"]:
+                    faiss_cpu = row
+
+            # For CatWhisper, try to find a matching row
+            cw_key = (cfg, idx_type, "single")
+            cw = cw_map.get(cw_key)
+
+            # Format output
+            cw_ms = f"{cw['mean']:>8.3f}" if cw else f"{'N/A':>8}"
+            cw_qps = f"{cw['qps']:>8.1f}" if cw else f"{'N/A':>8}"
+            cw_rec = f"{cw['recall']:>6.1%}" if cw and cw['recall'] >= 0 else f"{'N/A':>7}"
+
+            fg_ms = f"{faiss_gpu['mean']:>12.3f}" if faiss_gpu else f"{'N/A':>12}"
+            fg_qps = f"{faiss_gpu['qps']:>8.1f}" if faiss_gpu else f"{'N/A':>8}"
+            fg_rec = f"{faiss_gpu['recall']:>6.1%}" if faiss_gpu and faiss_gpu['recall'] >= 0 else f"{'N/A':>7}"
+
+            fc_ms = f"{faiss_cpu['mean']:>12.3f}" if faiss_cpu else f"{'N/A':>12}"
+            fc_qps = f"{faiss_cpu['qps']:>8.1f}" if faiss_cpu else f"{'N/A':>8}"
+            fc_rec = f"{faiss_cpu['recall']:>6.1%}" if faiss_cpu and faiss_cpu['recall'] >= 0 else f"{'N/A':>7}"
+
+            print(f"{cfg:<14} {cw_ms} {cw_qps} {cw_rec}  {fg_ms} {fg_qps} {fg_rec}  {fc_ms} {fc_qps} {fc_rec}")
 
     print()
-    print("Ratio CW/GPU > 1 means CatWhisper is slower than FAISS-GPU by that factor.")
+    print("CW = CatWhisper, GPU = FAISS-GPU, CPU = FAISS-CPU")
+    print("Rec = Recall@10 (higher is better)")
     print()
 
-    # Also print FAISS-CPU for reference
+    # Speedup summary
     print("-" * 60)
-    print("FAISS-CPU reference (single-query):")
-    print(f"{'Config':<14} {'Mean ms':>10} {'QPS':>10}")
-    print("-" * 38)
-    for cfg in configs:
-        k = (cfg, "single")
-        fcpu = faiss_map.get(k, {}).get("cpu")
-        if fcpu:
-            print(f"{cfg:<14} {fcpu['mean']:>10.3f} {fcpu['qps']:>10.1f}")
+    print("Speedup Summary (CatWhisper vs FAISS-GPU):")
+    print(f"{'Config':<14} {'Index':<8} {'CW/GPU Ratio':>12} {'Winner':>10}")
+    print("-" * 50)
+
+    for idx_type in index_types:
+        for cfg in configs:
+            k = (cfg, idx_type)
+            faiss_by_backend = faiss_map.get(k, {})
+
+            # Get best FAISS-GPU
+            faiss_gpu = None
+            for backend, row in faiss_by_backend.get("gpu", {}).items():
+                if faiss_gpu is None or row["mean"] < faiss_gpu["mean"]:
+                    faiss_gpu = row
+
+            cw_key = (cfg, idx_type, "single")
+            cw = cw_map.get(cw_key)
+
+            if cw and faiss_gpu:
+                ratio = cw["mean"] / faiss_gpu["mean"]
+                winner = "CW" if ratio < 1.0 else "FAISS"
+                print(f"{cfg:<14} {idx_type:<8} {ratio:>12.2f}x {winner:>10}")
 
 
 if __name__ == "__main__":
