@@ -18,6 +18,8 @@
 
 #if defined(__AVX512F__)
 #include <immintrin.h>
+#elif defined(__AVX2__)
+#include <immintrin.h>
 #endif
 
 namespace cw {
@@ -60,10 +62,70 @@ struct IndexHNSW::Impl {
     DescriptorSet gpu_distance_desc_set;
 
     float distance(const float* a, const float* b) const {
+#if defined(__AVX512F__)
+        float result = 0.0f;
+        const float* end = a + dimension;
+        
+        __m512 sum = _mm512_setzero_ps();
+        
+        while (a + 16 <= end) {
+            __m512 va = _mm512_loadu_ps(a);
+            __m512 vb = _mm512_loadu_ps(b);
+            __m512 diff = _mm512_sub_ps(va, vb);
+            sum = _mm512_fmadd_ps(diff, diff, sum);
+            a += 16;
+            b += 16;
+        }
+        
+        result = _mm512_reduce_add_ps(sum);
+        
+        while (a < end) {
+            float d = *a - *b;
+            result += d * d;
+            ++a;
+            ++b;
+        }
+        
+        if (metric == Metric::IP) {
+            return -result;
+        }
+        return result;
+#elif defined(__AVX2__)
+        float result = 0.0f;
+        const float* end = a + dimension;
+        
+        __m256 sum = _mm256_setzero_ps();
+        
+        while (a + 8 <= end) {
+            __m256 va = _mm256_loadu_ps(a);
+            __m256 vb = _mm256_loadu_ps(b);
+            __m256 diff = _mm256_sub_ps(va, vb);
+            sum = _mm256_fmadd_ps(diff, diff, sum);
+            a += 8;
+            b += 8;
+        }
+        
+        alignas(32) float temp[8];
+        _mm256_store_ps(temp, sum);
+        for (int i = 0; i < 8; ++i) result += temp[i];
+        
+        while (a < end) {
+            float d = *a - *b;
+            result += d * d;
+            ++a;
+            ++b;
+        }
+        
+        if (metric == Metric::IP) {
+            return -result;
+        }
+        return result;
+#else
         if (metric == Metric::IP) {
             return -distance::inner_product({a, dimension}, {b, dimension});
         }
         return distance::l2_sqr({a, dimension}, {b, dimension});
+#endif
     }
 
     const float* get_vector(uint32_t node_id) const {
@@ -428,16 +490,159 @@ Expected<void> IndexHNSW::add(std::span<const float> data, uint64_t n,
         return make_unexpected(ErrorCode::InvalidParameter, "Data size mismatch");
     }
 
-    uint64_t base_id = impl_->n_vectors;
+    if (n == 0) return {};
+
+    std::unique_lock lock(impl_->mutex);
+
+    uint64_t start_id = impl_->n_vectors;
+    
+    impl_->data.reserve(impl_->data.size() + n * impl_->dimension);
+    impl_->nodes.reserve(impl_->nodes.size() + n);
+    impl_->id_mapping.reserve(impl_->id_mapping.size() + n);
+
+    std::vector<uint32_t> new_levels(n);
     for (uint64_t i = 0; i < n; ++i) {
-        VectorId id = ids.empty() ? static_cast<VectorId>(base_id + i) : ids[i];
-        auto result = impl_->insert_node(data.data() + i * impl_->dimension, id);
-        if (!result) {
-            return result;
+        VectorId id = ids.empty() ? static_cast<VectorId>(start_id + i) : ids[i];
+        
+        if (impl_->id_set.count(id)) {
+            continue;
+        }
+
+        const float* vec = data.data() + i * impl_->dimension;
+        
+        impl_->data.insert(impl_->data.end(), vec, vec + impl_->dimension);
+        impl_->id_mapping.push_back(id);
+        impl_->id_set.insert(id);
+
+        uint32_t level = impl_->random_level();
+        level = std::min(level, MAX_LAYERS - 1);
+        new_levels[i] = level;
+
+        Node node;
+        node.id = static_cast<uint32_t>(impl_->n_vectors);
+        node.level = level;
+        node.neighbors.resize(level + 1);
+        impl_->nodes.push_back(std::move(node));
+        impl_->n_vectors++;
+    }
+
+    if (impl_->entry_point == INVALID_NODE && impl_->n_vectors > 0) {
+        uint32_t max_lvl = 0;
+        uint32_t max_node = 0;
+        for (size_t i = 0; i < new_levels.size(); ++i) {
+            if (new_levels[i] > max_lvl) {
+                max_lvl = new_levels[i];
+                max_node = static_cast<uint32_t>(start_id + i);
+            }
+        }
+        impl_->entry_point = max_node;
+        impl_->max_level = max_lvl;
+    }
+
+    lock.unlock();
+
+    uint32_t num_threads = std::min(std::thread::hardware_concurrency(), static_cast<unsigned int>(n));
+    if (num_threads == 0) num_threads = 1;
+    
+    if (n < 100 || num_threads == 1) {
+        for (uint64_t i = 0; i < n; ++i) {
+            if (new_levels[i] == 0 && start_id + i == impl_->entry_point) continue;
+            connect_node(static_cast<uint32_t>(start_id + i), new_levels[i]);
+        }
+    } else {
+        std::atomic<uint64_t> next_idx{0};
+        
+        auto worker = [&]() {
+            while (true) {
+                uint64_t idx = next_idx.fetch_add(1);
+                if (idx >= n) break;
+                
+                uint32_t node_id = static_cast<uint32_t>(start_id + idx);
+                if (new_levels[idx] == 0 && node_id == impl_->entry_point) continue;
+                
+                connect_node(node_id, new_levels[idx]);
+            }
+        };
+        
+        std::vector<std::thread> threads;
+        threads.reserve(num_threads - 1);
+        for (uint32_t t = 0; t < num_threads - 1; ++t) {
+            threads.emplace_back(worker);
+        }
+        worker();
+        
+        for (auto& t : threads) {
+            t.join();
         }
     }
 
     return {};
+}
+
+void IndexHNSW::connect_node(uint32_t node_id, uint32_t level) {
+    if (!impl_ || impl_->entry_point == INVALID_NODE || node_id == impl_->entry_point) return;
+    
+    const float* vec = impl_->get_vector(node_id);
+    
+    std::vector<uint32_t> ep_set = {impl_->entry_point};
+    
+    int max_search_level = static_cast<int>(impl_->max_level);
+    
+    {
+        std::shared_lock read_lock(impl_->mutex);
+        for (int lc = max_search_level; lc > static_cast<int>(level); --lc) {
+            auto results = impl_->search_layer(vec, static_cast<uint32_t>(lc), 1, ep_set);
+            if (!results.empty()) {
+                ep_set = {results[0].second};
+            }
+        }
+    }
+    
+    for (int lc = std::min(static_cast<int>(level), max_search_level); lc >= 0; --lc) {
+        std::vector<std::pair<float, uint32_t>> neighbors;
+        
+        {
+            std::shared_lock read_lock(impl_->mutex);
+            auto results = impl_->search_layer(vec, static_cast<uint32_t>(lc), impl_->params.ef_construction, ep_set);
+            
+            uint32_t max_conn = (lc == 0) ? impl_->params.M * 2 : impl_->params.M;
+            
+            for (const auto& r : results) {
+                neighbors.push_back(r);
+            }
+            
+            impl_->select_neighbors_simple(neighbors, max_conn);
+        }
+        
+        {
+            std::unique_lock write_lock(impl_->mutex);
+            
+            uint32_t max_conn = (lc == 0) ? impl_->params.M * 2 : impl_->params.M;
+            
+            impl_->nodes[node_id].neighbors[lc].reserve(neighbors.size());
+            for (const auto& [n_dist, n_id] : neighbors) {
+                impl_->nodes[node_id].neighbors[lc].push_back(n_id);
+                
+                Node& neighbor_node = impl_->nodes[n_id];
+                if (lc >= static_cast<int>(neighbor_node.neighbors.size())) {
+                    neighbor_node.neighbors.resize(lc + 1);
+                }
+                neighbor_node.neighbors[lc].push_back(node_id);
+                
+                if (neighbor_node.neighbors[lc].size() > max_conn) {
+                    impl_->shrink_connections(n_id, static_cast<uint32_t>(lc), max_conn);
+                }
+            }
+        }
+        
+        if (!neighbors.empty()) {
+            std::shared_lock read_lock(impl_->mutex);
+            ep_set.clear();
+            for (const auto& [dist, id] : neighbors) {
+                ep_set.push_back(id);
+            }
+        }
+    }
 }
 
 Expected<SearchResults> IndexHNSW::search(Vector query, uint32_t k) {

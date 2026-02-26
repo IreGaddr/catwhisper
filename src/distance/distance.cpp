@@ -93,14 +93,24 @@ float inner_product(std::span<const float> a, std::span<const float> b) {
 }
 
 float cosine_similarity(std::span<const float> a, std::span<const float> b) {
-    float dot = inner_product(a, b);
-    float norm_a_sq = l2_sqr(a, std::span<float>{});
-    float norm_b_sq = l2_sqr(b, std::span<float>{});
-    
-    if (norm_a_sq == 0 || norm_b_sq == 0) {
+    const size_t n = std::min(a.size(), b.size());
+    if (n == 0) {
         return 0.0f;
     }
-    
+
+    float dot = 0.0f;
+    float norm_a_sq = 0.0f;
+    float norm_b_sq = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        dot += a[i] * b[i];
+        norm_a_sq += a[i] * a[i];
+        norm_b_sq += b[i] * b[i];
+    }
+
+    if (norm_a_sq <= 0.0f || norm_b_sq <= 0.0f) {
+        return 0.0f;
+    }
+
     return dot / (std::sqrt(norm_a_sq) * std::sqrt(norm_b_sq));
 }
 

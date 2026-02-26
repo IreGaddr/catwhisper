@@ -71,6 +71,7 @@ private:
     uint32_t ef_search_ = 50;
 
     Expected<void> add_single(const float* vec, VectorId id);
+    void connect_node(uint32_t node_id, uint32_t level);
     void search_single_locked(const float* query, uint32_t k, SearchResult* out);
     Expected<SearchResults> search_batch_gpu(std::span<const float> queries,
                                              uint64_t n_queries, uint32_t k);
