@@ -15,12 +15,26 @@ struct HNSWParams {
     float ml_factor = 0.0f;               // Level multiplier (0 = auto: 1/ln(M))
 };
 
+struct HNSWGPUOptions {
+    bool enable = false;                  // Enable GPU acceleration
+    bool use_fp16 = true;                 // Use FP16 for GPU vectors
+    uint32_t batch_threshold = 1000;      // Use GPU only for batches >= this size
+};
+
 class IndexHNSW : public IndexBase {
 public:
     [[nodiscard]] static Expected<IndexHNSW> create(
         uint32_t dimension,
         const HNSWParams& params = {},
         const IndexOptions& options = {}
+    );
+    
+    [[nodiscard]] static Expected<IndexHNSW> create_gpu(
+        Context& ctx,
+        uint32_t dimension,
+        const HNSWParams& params = {},
+        const IndexOptions& options = {},
+        const HNSWGPUOptions& gpu_options = {}
     );
 
     IndexHNSW() = default;
@@ -49,6 +63,7 @@ public:
     uint32_t ef_search() const { return ef_search_; }
 
     bool valid() const { return impl_ != nullptr; }
+    bool gpu_enabled() const;
 
 private:
     struct Impl;
@@ -56,6 +71,9 @@ private:
     uint32_t ef_search_ = 50;
 
     Expected<void> add_single(const float* vec, VectorId id);
+    void search_single_locked(const float* query, uint32_t k, SearchResult* out);
+    Expected<SearchResults> search_batch_gpu(std::span<const float> queries,
+                                             uint64_t n_queries, uint32_t k);
 };
 
 } // namespace cw

@@ -107,6 +107,9 @@ static void convert_f32_to_f16_into(const float* __restrict__ src,
 // TOPK_CHUNK must match the CHUNK constant in topk_heap.comp and distance_topk_fused.comp.
 static constexpr uint32_t TOPK_CHUNK = 2048u;
 
+// AMD-optimized: larger chunks reduce CPU merge overhead
+static constexpr uint32_t AMD_CHUNK = 8192u;
+
 struct IndexFlat::Impl {
     Context* ctx = nullptr;
     uint32_t dimension = 0;
@@ -129,6 +132,12 @@ struct IndexFlat::Impl {
     Pipeline fused_l2_pipeline;
     Pipeline fused_ip_pipeline;
     DescriptorSet fused_desc_set;
+
+    // AMD-optimized fused pipeline (larger chunks, heap-based top-k)
+    Pipeline amd_l2_pipeline;
+    Pipeline amd_ip_pipeline;
+    DescriptorSet amd_desc_set;
+    bool amd_available = false;
 
     // Batch search pipeline
     Pipeline batch_pipeline;
@@ -325,6 +334,35 @@ Expected<void> IndexFlat::init_pipelines() {
                                "Failed to create batch descriptor set");
     }
     impl_->batch_desc_set = std::move(*batch_desc_result);
+
+    // ---- AMD-optimized fused pipeline (larger chunks, heap-based top-k) ----
+    PipelineDesc amd_l2_desc;
+    amd_l2_desc.shader_name = "distance_topk_amd";
+    amd_l2_desc.bindings = {
+        {0, DescriptorBinding::StorageBuffer},  // database
+        {1, DescriptorBinding::StorageBuffer},  // query
+        {2, DescriptorBinding::StorageBuffer},  // out_distances
+        {3, DescriptorBinding::StorageBuffer},  // out_indices
+    };
+    amd_l2_desc.push_constant_size = 20;  // n_vectors, dimension, k, metric, capacity
+
+    auto amd_l2_result = Pipeline::create(*impl_->ctx, amd_l2_desc);
+    if (amd_l2_result) {
+        impl_->amd_l2_pipeline = std::move(*amd_l2_result);
+        
+        // AMD IP pipeline uses same shader with metric=1 push constant
+        impl_->amd_ip_pipeline = std::move(*Pipeline::create(*impl_->ctx, amd_l2_desc));
+        
+        auto amd_desc_result = DescriptorSet::create(*impl_->ctx, impl_->amd_l2_pipeline);
+        if (amd_desc_result) {
+            impl_->amd_desc_set = std::move(*amd_desc_result);
+            impl_->amd_available = true;
+            fprintf(stderr, "[DEBUG] AMD pipeline loaded successfully\n");
+        }
+    } else {
+        fprintf(stderr, "[DEBUG] AMD pipeline failed: %s\n", amd_l2_result.error().message().c_str());
+    }
+    // If AMD pipeline fails, we fall back to the standard fused pipeline
 
     // ---- SoA maintenance pipelines ----
     // Transpose add: AoS staging -> SoA database
@@ -631,7 +669,9 @@ Expected<SearchResults> IndexFlat::search(Vector query, uint32_t k) {
     }
     
     // ---- Allocate partial-result buffers ----
-    uint32_t n_topk_wg = (static_cast<uint32_t>(impl_->n_vectors) + TOPK_CHUNK - 1u) / TOPK_CHUNK;
+    // Use AMD-optimized pipeline if available (larger chunks = fewer workgroups = less CPU merge)
+    const uint32_t chunk_size = impl_->amd_available ? AMD_CHUNK : TOPK_CHUNK;
+    uint32_t n_topk_wg = (static_cast<uint32_t>(impl_->n_vectors) + chunk_size - 1u) / chunk_size;
     uint64_t partial_size = static_cast<uint64_t>(n_topk_wg) * k * sizeof(float);
 
     if (!impl_->result_distances_buffer.valid() ||
@@ -664,7 +704,10 @@ Expected<SearchResults> IndexFlat::search(Vector query, uint32_t k) {
         impl_->search_cmd_valid = false;
     }
 
-    // ---- Update fused descriptor set only when VkBuffer handles change ----
+    // ---- Update descriptor set only when VkBuffer handles change ----
+    // Use AMD descriptor set if AMD pipeline is available
+    DescriptorSet& active_desc_set = impl_->amd_available ? impl_->amd_desc_set : impl_->fused_desc_set;
+    
     // submit_and_wait guarantees the previous submission has completed before we
     // reach this point, so the descriptor set is not "in use" and
     // vkUpdateDescriptorSets is safe.  On steady-state queries (same index, same
@@ -676,13 +719,13 @@ Expected<SearchResults> IndexFlat::search(Vector query, uint32_t k) {
         auto cur_ridx  = reinterpret_cast<VkBuffer>(impl_->result_indices_buffer.vulkan_buffer());
 
         if (cur_data != impl_->fused_bound_data) {
-            auto r = impl_->fused_desc_set.bind_buffer(0, impl_->data_buffer);
+            auto r = active_desc_set.bind_buffer(0, impl_->data_buffer);
             if (!r) return make_unexpected(r.error().code(), r.error().message());
             impl_->fused_bound_data  = cur_data;
             impl_->search_cmd_valid  = false;  // dispatch count depends on n_vectors
         }
         if (cur_query != impl_->fused_bound_query) {
-            auto r = impl_->fused_desc_set.bind_buffer(1, impl_->query_buffer);
+            auto r = active_desc_set.bind_buffer(1, impl_->query_buffer);
             if (!r) return make_unexpected(r.error().code(), r.error().message());
             impl_->fused_bound_query = cur_query;
             // Query buffer handle is constant across queries; only its contents
@@ -691,23 +734,23 @@ Expected<SearchResults> IndexFlat::search(Vector query, uint32_t k) {
             // cmd validity is unaffected.
         }
         if (cur_rdist != impl_->fused_bound_rdist) {
-            auto r = impl_->fused_desc_set.bind_buffer(2, impl_->result_distances_buffer);
+            auto r = active_desc_set.bind_buffer(2, impl_->result_distances_buffer);
             if (!r) return make_unexpected(r.error().code(), r.error().message());
             impl_->fused_bound_rdist = cur_rdist;
             impl_->search_cmd_valid  = false;
         }
         if (cur_ridx != impl_->fused_bound_ridx) {
-            auto r = impl_->fused_desc_set.bind_buffer(3, impl_->result_indices_buffer);
+            auto r = active_desc_set.bind_buffer(3, impl_->result_indices_buffer);
             if (!r) return make_unexpected(r.error().code(), r.error().message());
             impl_->fused_bound_ridx  = cur_ridx;
             impl_->search_cmd_valid  = false;
         }
     }
 
-    // ---- Select pipeline based on metric ----
-    Pipeline& fused_pipeline = (impl_->metric == Metric::IP)
-        ? impl_->fused_ip_pipeline
-        : impl_->fused_l2_pipeline;
+    // ---- Select pipeline based on metric and AMD availability ----
+    Pipeline& fused_pipeline = impl_->amd_available
+        ? ((impl_->metric == Metric::IP) ? impl_->amd_ip_pipeline : impl_->amd_l2_pipeline)
+        : ((impl_->metric == Metric::IP) ? impl_->fused_ip_pipeline : impl_->fused_l2_pipeline);
 
     // ---- Record or reuse command buffer ----
     // need_rerecord is true on first call, when k changes, when n_vectors changes,
@@ -735,7 +778,7 @@ Expected<SearchResults> IndexFlat::search(Vector query, uint32_t k) {
         // re-submitted for the next query without re-recording.
         impl_->search_cmd.begin_reusable();
         impl_->search_cmd.bind_pipeline(fused_pipeline);
-        impl_->search_cmd.bind_descriptor_set(fused_pipeline, impl_->fused_desc_set);
+        impl_->search_cmd.bind_descriptor_set(fused_pipeline, active_desc_set);
 
         struct FusedPushConstants {
             uint32_t n_vectors;

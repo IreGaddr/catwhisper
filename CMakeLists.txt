@@ -79,15 +79,33 @@ elseif(UNIX)
 endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # AMD Zen 4 (Ryzen 7 H 255) optimizations
+    # -march=znver4 targets Zen 4 specifically for optimal AVX512/FP16 performance
+    # -mtune=znver4 tunes for Zen 4 microarchitecture
+    # -fno-plt avoids PLT overhead for better performance
+    # -ffast-math enables aggressive floating-point optimizations
     target_compile_options(catwhisper PRIVATE
         -Wall -Wextra -Wpedantic
         -Wno-unused-parameter
         -Werror=return-type
-        $<$<CONFIG:Release>:-march=native>
+        $<$<CONFIG:Release>:-march=znver4>
+        $<$<CONFIG:Release>:-mtune=znver4>
         $<$<CONFIG:Release>:-ftree-vectorize>
+        $<$<CONFIG:Release>:-ffast-math>
+        $<$<CONFIG:Release>:-fno-plt>
+        $<$<CONFIG:Release>:-funroll-loops>
+    )
+    # Enable AVX512, F16C, and other SIMD extensions
+    target_compile_options(catwhisper PRIVATE
+        $<$<CONFIG:Release>:-mavx512f>
+        $<$<CONFIG:Release>:-mavx512dq>
+        $<$<CONFIG:Release>:-mavx512vl>
+        $<$<CONFIG:Release>:-mavx512bw>
+        $<$<CONFIG:Release>:-mf16c>
+        $<$<CONFIG:Release>:-mfma>
     )
 elseif(MSVC)
-    target_compile_options(catwhisper PRIVATE /W4 /wd4100)
+    target_compile_options(catwhisper PRIVATE /W4 /wd4100 /fp:fast)
 endif()
 
 add_subdirectory(shaders)

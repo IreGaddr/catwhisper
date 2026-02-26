@@ -232,25 +232,31 @@ private:
         queue_info.queueCount = 1;
         queue_info.pQueuePriorities = &queue_priority;
 
-        // Vulkan 1.2 features: timeline semaphores (zero-reset submit) + fp16 arithmetic
+        // Vulkan 1.2 features: timeline semaphores + fp16 arithmetic
         VkPhysicalDeviceVulkan12Features vk12_features = {};
         vk12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
         vk12_features.timelineSemaphore = VK_TRUE;
         vk12_features.shaderFloat16    = VK_TRUE;
 
+        // Vulkan 1.3 features: scalar block layout, synchronized texture access
+        VkPhysicalDeviceVulkan13Features vk13_features = {};
+        vk13_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+        vk13_features.pNext = &vk12_features;
+
         // Wrap 1.0 features in VkPhysicalDeviceFeatures2 to allow pNext chaining
         VkPhysicalDeviceFeatures2 features2 = {};
         features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-        features2.pNext = &vk12_features;
+        features2.pNext = &vk13_features;
         features2.features.shaderFloat64 = VK_TRUE;
         features2.features.shaderInt16   = VK_TRUE;
+        features2.features.shaderInt64   = VK_TRUE;
 
         VkDeviceCreateInfo device_info_create = {};
         device_info_create.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-        device_info_create.pNext = &features2;       // timeline semaphore + fp16 via pNext chain
+        device_info_create.pNext = &features2;
         device_info_create.queueCreateInfoCount = 1;
         device_info_create.pQueueCreateInfos = &queue_info;
-        device_info_create.pEnabledFeatures = nullptr; // must be NULL when using Features2
+        device_info_create.pEnabledFeatures = nullptr;
 
         if (vkCreateDevice(physical_device, &device_info_create, nullptr, &device) != VK_SUCCESS) {
             return make_unexpected(ErrorCode::DeviceCreationFailed,

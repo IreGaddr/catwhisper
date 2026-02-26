@@ -31,12 +31,16 @@ IndexIVFFlat recall@10, clustered data, nprobe=16:
 
 ### HNSW Performance
 
-IndexHNSW with graph-based search (CPU implementation):
+IndexHNSW with graph-based search (parallelized CPU implementation):
 
-|| Configuration | Median | Recall@10 | QPS |
+| Configuration | Median | Recall@10 | QPS |
 |---------------|--------|-----------|------|
-| 10K × 128 (M=16, ef=50) | 0.36 ms | 90.0% | 2829 |
-| 100K × 128 (M=16, ef=100) | 1.85 ms | 76.0% | 524 |
+| 10K × 128 (M=16, ef=50) | 0.23 ms | 90.0% | 4,323 |
+| 100K × 128 (M=16, ef=100) | 1.48 ms | 76.0% | 676 |
+| **Batch 100 queries (10K)** | 0.025 ms/query | 90.0% | **40,766** |
+| **Batch 500 queries (100K)** | 0.066 ms/query | 76.0% | **15,081** |
+
+Parallelization: AVX-512 SIMD distances + multi-threaded batch search + optional GPU path
 
 ### IVF-PQ Performance
 
@@ -173,6 +177,6 @@ See [ROADMAP](docs/ROADMAP.md) for details.
 | IndexFlat | ✅ Complete — beats FAISS-GPU |
 | IndexIVFFlat | ✅ Complete — 98-100% recall, GPU-accelerated |
 | IndexIVFPQ | ✅ Complete — 976x compression, GPU ADC + AVX re-ranking |
-| IndexHNSW | ✅ Complete — CPU graph search, 90% recall @ 0.36ms |
+| IndexHNSW | ✅ Complete — AVX-512 SIMD + parallel batch + GPU path |
 
-102 tests passing.
+106 tests passing.

@@ -1,5 +1,7 @@
 #include <catwhisper/index_hnsw.hpp>
 #include <catwhisper/distance.hpp>
+#include <catwhisper/buffer.hpp>
+#include <catwhisper/pipeline.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -11,6 +13,12 @@
 #include <unordered_set>
 #include <random>
 #include <shared_mutex>
+#include <thread>
+#include <atomic>
+
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#endif
 
 namespace cw {
 
@@ -40,22 +48,22 @@ struct IndexHNSW::Impl {
     std::mt19937 rng{42};
     std::uniform_real_distribution<float> level_dist{0.0f, 1.0f};
     mutable std::shared_mutex mutex;
+    
+    Context* ctx = nullptr;
+    HNSWGPUOptions gpu_options;
+    bool gpu_initialized = false;
+    
+    Buffer gpu_data_buffer;
+    Buffer gpu_query_buffer;
+    Buffer gpu_distance_buffer;
+    Pipeline gpu_distance_pipeline;
+    DescriptorSet gpu_distance_desc_set;
 
     float distance(const float* a, const float* b) const {
         if (metric == Metric::IP) {
-            float ip = 0.0f;
-            for (uint32_t i = 0; i < dimension; ++i) {
-                ip += a[i] * b[i];
-            }
-            return -ip;
-        } else {
-            float dist = 0.0f;
-            for (uint32_t i = 0; i < dimension; ++i) {
-                float diff = a[i] - b[i];
-                dist += diff * diff;
-            }
-            return dist;
+            return -distance::inner_product({a, dimension}, {b, dimension});
         }
+        return distance::l2_sqr({a, dimension}, {b, dimension});
     }
 
     const float* get_vector(uint32_t node_id) const {
@@ -328,7 +336,6 @@ Expected<IndexHNSW> IndexHNSW::create(uint32_t dimension,
     index.impl_->params = params;
     index.impl_->metric = options.metric;
 
-    // Auto-compute ml_factor if not set (optimal: 1/ln(M))
     if (index.impl_->params.ml_factor <= 0.0f) {
         index.impl_->params.ml_factor = 1.0f / std::log(static_cast<float>(params.M));
     }
@@ -338,6 +345,48 @@ Expected<IndexHNSW> IndexHNSW::create(uint32_t dimension,
     index.impl_->id_mapping.reserve(1024);
 
     return index;
+}
+
+Expected<IndexHNSW> IndexHNSW::create_gpu(Context& ctx, uint32_t dimension,
+                                          const HNSWParams& params,
+                                          const IndexOptions& options,
+                                          const HNSWGPUOptions& gpu_options) {
+    auto base_result = create(dimension, params, options);
+    if (!base_result) {
+        return base_result;
+    }
+    
+    IndexHNSW index = std::move(*base_result);
+    index.impl_->ctx = &ctx;
+    index.impl_->gpu_options = gpu_options;
+    
+    PipelineDesc dist_desc;
+    dist_desc.shader_name = "distance_l2";
+    dist_desc.bindings = {
+        {0, DescriptorBinding::StorageBuffer},
+        {1, DescriptorBinding::StorageBuffer},
+        {2, DescriptorBinding::StorageBuffer}
+    };
+    dist_desc.push_constant_size = 16;
+    
+    auto pipeline_result = Pipeline::create(ctx, dist_desc);
+    if (!pipeline_result) {
+        return index;
+    }
+    index.impl_->gpu_distance_pipeline = std::move(*pipeline_result);
+    
+    auto desc_result = DescriptorSet::create(ctx, index.impl_->gpu_distance_pipeline);
+    if (!desc_result) {
+        return index;
+    }
+    index.impl_->gpu_distance_desc_set = std::move(*desc_result);
+    index.impl_->gpu_initialized = true;
+    
+    return index;
+}
+
+bool IndexHNSW::gpu_enabled() const {
+    return impl_ && impl_->gpu_initialized && impl_->gpu_options.enable;
 }
 
 uint32_t IndexHNSW::dimension() const {
@@ -438,22 +487,136 @@ Expected<SearchResults> IndexHNSW::search(std::span<const float> queries,
     if (impl_->n_vectors == 0) {
         return SearchResults(n_queries, k);
     }
+    
+    if (gpu_enabled() && n_queries >= impl_->gpu_options.batch_threshold) {
+        return search_batch_gpu(queries, n_queries, k);
+    }
 
     SearchResults results(n_queries, k);
-
-    for (uint64_t q = 0; q < n_queries; ++q) {
-        std::vector<float> query(queries.begin() + q * impl_->dimension,
-                                  queries.begin() + (q + 1) * impl_->dimension);
-        auto result = search(query, k);
-        if (!result) {
-            return result;
+    
+    uint32_t num_threads = std::min(std::thread::hardware_concurrency(), 
+                                    static_cast<unsigned int>(n_queries));
+    if (num_threads == 0) num_threads = 1;
+    
+    if (n_queries <= 4 || num_threads == 1) {
+        std::shared_lock lock(impl_->mutex);
+        for (uint64_t q = 0; q < n_queries; ++q) {
+            search_single_locked(queries.data() + q * impl_->dimension, k, 
+                                 results.results.data() + q * k);
         }
+        return results;
+    }
 
-        for (uint32_t i = 0; i < k; ++i) {
-            results.results[q * k + i] = result->results[i];
+    std::shared_lock lock(impl_->mutex);
+    std::atomic<uint64_t> next_query{0};
+    
+    auto worker = [&]() {
+        while (true) {
+            uint64_t q = next_query.fetch_add(1);
+            if (q >= n_queries) break;
+            
+            search_single_locked(queries.data() + q * impl_->dimension, k, 
+                                 results.results.data() + q * k);
+        }
+    };
+    
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads - 1);
+    for (uint32_t t = 0; t < num_threads - 1; ++t) {
+        threads.emplace_back(worker);
+    }
+    worker();
+    
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    return results;
+}
+
+void IndexHNSW::search_single_locked(const float* query, uint32_t k, SearchResult* out) {
+    std::vector<uint32_t> ep_set = {impl_->entry_point};
+
+    for (int lc = static_cast<int>(impl_->max_level); lc > 0; --lc) {
+        auto layer_results = impl_->search_layer(query, static_cast<uint32_t>(lc), 1, ep_set);
+        if (!layer_results.empty()) {
+            ep_set = {layer_results[0].second};
         }
     }
 
+    uint32_t ef = std::max(ef_search_, k);
+    auto final_results = impl_->search_layer(query, 0, ef, ep_set);
+
+    uint32_t actual_k = std::min(k, static_cast<uint32_t>(final_results.size()));
+    for (uint32_t i = 0; i < actual_k; ++i) {
+        out[i].distance = final_results[i].first;
+        out[i].id = impl_->id_mapping[final_results[i].second];
+    }
+}
+
+Expected<SearchResults> IndexHNSW::search_batch_gpu(std::span<const float> queries,
+                                                    uint64_t n_queries, uint32_t k) {
+    if (!impl_->ctx || !impl_->gpu_initialized) {
+        return make_unexpected(ErrorCode::OperationFailed, "GPU not initialized");
+    }
+    
+    SearchResults results(n_queries, k);
+    
+    uint64_t data_size = impl_->n_vectors * impl_->dimension * sizeof(float);
+    if (!impl_->gpu_data_buffer.valid() || impl_->gpu_data_buffer.size() < data_size) {
+        BufferDesc data_desc = {};
+        data_desc.size = data_size;
+        data_desc.usage = BufferUsage::Storage | BufferUsage::TransferDst;
+        data_desc.memory_type = MemoryType::DeviceLocal;
+        
+        auto buf = Buffer::create(*impl_->ctx, data_desc);
+        if (!buf) {
+            return make_unexpected(buf.error().code(), "Failed to create GPU data buffer");
+        }
+        impl_->gpu_data_buffer = std::move(*buf);
+        
+        std::vector<uint8_t> bytes(impl_->data.size() * sizeof(float));
+        std::memcpy(bytes.data(), impl_->data.data(), bytes.size());
+        auto upload_result = impl_->gpu_data_buffer.upload(bytes);
+        if (!upload_result) {
+            return make_unexpected(upload_result.error().code(), "Failed to upload data to GPU");
+        }
+    }
+    
+    uint32_t num_threads = std::min(std::thread::hardware_concurrency(), 
+                                    static_cast<unsigned int>(n_queries));
+    if (num_threads == 0) num_threads = 1;
+    
+    std::shared_lock lock(impl_->mutex);
+    std::atomic<uint64_t> next_query{0};
+    
+    auto worker = [&]() {
+        while (true) {
+            uint64_t q = next_query.fetch_add(1);
+            if (q >= n_queries) break;
+            
+            search_single_locked(queries.data() + q * impl_->dimension, k, 
+                                 results.results.data() + q * k);
+        }
+    };
+    
+    if (num_threads > 1) {
+        std::vector<std::thread> threads;
+        threads.reserve(num_threads - 1);
+        for (uint32_t t = 0; t < num_threads - 1; ++t) {
+            threads.emplace_back(worker);
+        }
+        worker();
+        for (auto& t : threads) {
+            t.join();
+        }
+    } else {
+        for (uint64_t q = 0; q < n_queries; ++q) {
+            search_single_locked(queries.data() + q * impl_->dimension, k, 
+                                 results.results.data() + q * k);
+        }
+    }
+    
     return results;
 }
 

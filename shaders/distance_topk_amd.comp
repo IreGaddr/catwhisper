@@ -1,0 +1,128 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// AMD-optimized fused distance + top-k shader for RDNA3 (Radeon 780M).
+//
+// Optimizations:
+// 1. CHUNK = 8192 (4x larger than baseline) reduces CPU merge work by 4x
+// 2. local_size = 1024 threads, each handles 8 vectors
+// 3. Same bitonic sort algorithm, just more data
+
+layout(local_size_x = 1024) in;
+
+layout(set = 0, binding = 0) readonly buffer DatabaseBuffer {
+    float16_t database[];
+};
+
+layout(set = 0, binding = 1) readonly buffer QueryBuffer {
+    float16_t query[];
+};
+
+layout(set = 0, binding = 2) buffer OutputDistances {
+    float out_distances[];
+};
+
+layout(set = 0, binding = 3) buffer OutputIndices {
+    uint out_indices[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint n_vectors;
+    uint dimension;
+    uint k;
+    uint metric;
+    uint capacity;
+};
+
+struct Pair {
+    float dist;
+    uint idx;
+};
+
+const uint CHUNK = 8192u;
+shared Pair sort_buf[CHUNK];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wid = gl_WorkGroupID.x;
+    uint base = wid * CHUNK;
+
+    const float INF = uintBitsToFloat(0x7f800000u);
+    
+    // Initialize 8 elements per thread
+    sort_buf[tid].dist = INF;
+    sort_buf[tid].idx = 0xFFFFFFFFu;
+    sort_buf[tid + 1024u].dist = INF;
+    sort_buf[tid + 1024u].idx = 0xFFFFFFFFu;
+    sort_buf[tid + 2048u].dist = INF;
+    sort_buf[tid + 2048u].idx = 0xFFFFFFFFu;
+    sort_buf[tid + 3072u].dist = INF;
+    sort_buf[tid + 3072u].idx = 0xFFFFFFFFu;
+    sort_buf[tid + 4096u].dist = INF;
+    sort_buf[tid + 4096u].idx = 0xFFFFFFFFu;
+    sort_buf[tid + 5120u].dist = INF;
+    sort_buf[tid + 5120u].idx = 0xFFFFFFFFu;
+    sort_buf[tid + 6144u].dist = INF;
+    sort_buf[tid + 6144u].idx = 0xFFFFFFFFu;
+    sort_buf[tid + 7168u].dist = INF;
+    sort_buf[tid + 7168u].idx = 0xFFFFFFFFu;
+
+    barrier();
+
+    // Compute distances for 8 vectors per thread
+    for (uint v = 0u; v < 8u; ++v) {
+        uint pos = base + tid + v * 1024u;
+        if (pos < n_vectors) {
+            float sum = 0.0;
+            if (metric == 0u) {
+                for (uint d = 0u; d < dimension; ++d) {
+                    float diff = float(database[d * capacity + pos]) - float(query[d]);
+                    sum += diff * diff;
+                }
+            } else {
+                for (uint d = 0u; d < dimension; ++d) {
+                    sum += float(database[d * capacity + pos]) * float(query[d]);
+                }
+                sum = -sum;
+            }
+            sort_buf[tid + v * 1024u].dist = sum;
+            sort_buf[tid + v * 1024u].idx = pos;
+        }
+    }
+
+    barrier();
+
+    // Bitonic sort on 8192 elements
+    // Each thread handles 8 compare-swap operations per stage
+    for (uint bs = 2u; bs <= CHUNK; bs <<= 1u) {
+        for (uint stride = bs >> 1u; stride >= 1u; stride >>= 1u) {
+            barrier();
+
+            for (uint j = 0u; j < 8u; ++j) {
+                uint ci = tid * 8u + j;
+                uint i = (ci & ~(stride - 1u)) * 2u + (ci & (stride - 1u));
+                uint ixj = i | stride;
+
+                if (ixj < CHUNK) {
+                    bool ascending = ((i & bs) == 0u);
+                    bool need_swap = (sort_buf[i].dist > sort_buf[ixj].dist) == ascending;
+
+                    if (need_swap) {
+                        Pair tmp = sort_buf[i];
+                        sort_buf[i] = sort_buf[ixj];
+                        sort_buf[ixj] = tmp;
+                    }
+                }
+            }
+        }
+    }
+
+    barrier();
+
+    // Write top-k results
+    uint out_base = wid * k;
+    for (uint i = tid; i < k; i += 1024u) {
+        out_distances[out_base + i] = sort_buf[i].dist;
+        out_indices[out_base + i] = sort_buf[i].idx;
+    }
+}
