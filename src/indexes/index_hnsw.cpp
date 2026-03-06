@@ -4,6 +4,7 @@
 #include <catwhisper/pipeline.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -15,6 +16,9 @@
 #include <shared_mutex>
 #include <thread>
 #include <atomic>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #if defined(__AVX512F__)
 #include <immintrin.h>
@@ -26,6 +30,8 @@ namespace cw {
 
 static constexpr uint32_t MAX_LAYERS = 64;
 static constexpr uint32_t INVALID_NODE = 0xFFFFFFFFu;
+static constexpr size_t BUILD_LOCK_STRIPES = 8192;
+using BuildLockArray = std::array<std::shared_mutex, BUILD_LOCK_STRIPES>;
 
 struct Node {
     uint32_t id;
@@ -147,12 +153,14 @@ struct IndexHNSW::Impl {
 
     std::vector<std::pair<float, uint32_t>>
     search_layer(const float* query, uint32_t layer, uint32_t ef,
-                 const std::vector<uint32_t>& entry_points) {
+                 const std::vector<uint32_t>& entry_points,
+                 BuildLockArray* build_locks = nullptr) {
         std::unordered_set<uint32_t> visited;
         visited.reserve(ef * 4);
 
         MinHeap candidates;  // min-heap: smallest dist on top
         MaxHeap results;     // max-heap: largest dist on top
+        std::vector<uint32_t> neighbors_snapshot;
 
         for (uint32_t ep : entry_points) {
             float dist = distance(query, get_vector(ep));
@@ -165,15 +173,45 @@ struct IndexHNSW::Impl {
             auto [c_dist, c_id] = candidates.top();
             candidates.pop();
 
-            float f_dist = results.top().first;
-
             // Don't terminate early - explore all reachable candidates for better recall
             // Original: if (c_dist > f_dist && results.size() >= ef) break;
 
-            const Node& node = nodes[c_id];
-            if (layer >= node.neighbors.size()) continue;
+            if (build_locks == nullptr) {
+                const Node& node = nodes[c_id];
+                if (layer >= node.neighbors.size()) continue;
 
-            for (uint32_t neighbor : node.neighbors[layer]) {
+                for (uint32_t neighbor : node.neighbors[layer]) {
+                    if (visited.count(neighbor)) continue;
+                    visited.insert(neighbor);
+
+                    float n_dist = distance(query, get_vector(neighbor));
+                    float f_dist_now = results.empty() ? INFINITY : results.top().first;
+
+                    if (n_dist < f_dist_now || results.size() < ef) {
+                        candidates.emplace(n_dist, neighbor);
+                        results.emplace(n_dist, neighbor);
+
+                        while (results.size() > ef) {
+                            results.pop();
+                        }
+                    }
+                }
+                continue;
+            }
+
+            neighbors_snapshot.clear();
+            {
+                auto& stripe_lock =
+                    (*build_locks)[static_cast<size_t>(c_id) & (BUILD_LOCK_STRIPES - 1)];
+                std::shared_lock<std::shared_mutex> guard(stripe_lock);
+                const Node& node = nodes[c_id];
+                if (layer < node.neighbors.size()) {
+                    const auto& nbrs = node.neighbors[layer];
+                    neighbors_snapshot.assign(nbrs.begin(), nbrs.end());
+                }
+            }
+
+            for (uint32_t neighbor : neighbors_snapshot) {
                 if (visited.count(neighbor)) continue;
                 visited.insert(neighbor);
 
@@ -500,81 +538,261 @@ Expected<void> IndexHNSW::add(std::span<const float> data, uint64_t n,
     impl_->nodes.reserve(impl_->nodes.size() + n);
     impl_->id_mapping.reserve(impl_->id_mapping.size() + n);
 
+    const bool auto_ids = ids.empty();
+    std::vector<uint32_t> new_node_ids(n, INVALID_NODE);
     std::vector<uint32_t> new_levels(n);
-    for (uint64_t i = 0; i < n; ++i) {
-        VectorId id = ids.empty() ? static_cast<VectorId>(start_id + i) : ids[i];
-        
-        if (impl_->id_set.count(id)) {
-            continue;
+    uint64_t inserted = 0;
+    if (auto_ids) {
+        const size_t dim = impl_->dimension;
+        const size_t old_data_size = impl_->data.size();
+        impl_->data.resize(old_data_size + static_cast<size_t>(n) * dim);
+        std::memcpy(impl_->data.data() + old_data_size,
+                    data.data(),
+                    static_cast<size_t>(n) * dim * sizeof(float));
+
+        const size_t old_id_size = impl_->id_mapping.size();
+        impl_->id_mapping.resize(old_id_size + static_cast<size_t>(n));
+        for (uint64_t i = 0; i < n; ++i) {
+            impl_->id_mapping[old_id_size + static_cast<size_t>(i)] =
+                static_cast<VectorId>(start_id + i);
         }
 
-        const float* vec = data.data() + i * impl_->dimension;
-        
-        impl_->data.insert(impl_->data.end(), vec, vec + impl_->dimension);
-        impl_->id_mapping.push_back(id);
-        impl_->id_set.insert(id);
+        const size_t old_node_size = impl_->nodes.size();
+        impl_->nodes.resize(old_node_size + static_cast<size_t>(n));
+        for (uint64_t i = 0; i < n; ++i) {
+            uint32_t level = impl_->random_level();
+            level = std::min(level, MAX_LAYERS - 1);
+            new_levels[i] = level;
 
-        uint32_t level = impl_->random_level();
-        level = std::min(level, MAX_LAYERS - 1);
-        new_levels[i] = level;
+            const uint32_t node_id = static_cast<uint32_t>(start_id + i);
+            new_node_ids[i] = node_id;
 
-        Node node;
-        node.id = static_cast<uint32_t>(impl_->n_vectors);
-        node.level = level;
-        node.neighbors.resize(level + 1);
-        impl_->nodes.push_back(std::move(node));
-        impl_->n_vectors++;
+            Node& node = impl_->nodes[static_cast<size_t>(node_id)];
+            node.id = node_id;
+            node.level = level;
+            node.neighbors.clear();
+            node.neighbors.resize(level + 1);
+            for (uint32_t l = 0; l <= level; ++l) {
+                const uint32_t max_conn = (l == 0) ? impl_->params.M * 2 : impl_->params.M;
+                node.neighbors[l].reserve(max_conn * 4);
+            }
+        }
+
+        impl_->n_vectors += n;
+        inserted = n;
+    } else {
+        for (uint64_t i = 0; i < n; ++i) {
+            VectorId id = ids[i];
+
+            if (impl_->id_set.count(id)) {
+                continue;
+            }
+
+            const float* vec = data.data() + i * impl_->dimension;
+
+            impl_->data.insert(impl_->data.end(), vec, vec + impl_->dimension);
+            impl_->id_mapping.push_back(id);
+            impl_->id_set.insert(id);
+
+            uint32_t level = impl_->random_level();
+            level = std::min(level, MAX_LAYERS - 1);
+            new_levels[i] = level;
+
+            uint32_t node_id = static_cast<uint32_t>(impl_->n_vectors);
+            new_node_ids[i] = node_id;
+
+            Node node;
+            node.id = node_id;
+            node.level = level;
+            node.neighbors.resize(level + 1);
+            for (uint32_t l = 0; l <= level; ++l) {
+                const uint32_t max_conn = (l == 0) ? impl_->params.M * 2 : impl_->params.M;
+                node.neighbors[l].reserve(max_conn * 4);
+            }
+            impl_->nodes.push_back(std::move(node));
+            impl_->n_vectors++;
+            inserted++;
+        }
+    }
+
+    if (inserted == 0) {
+        return {};
     }
 
     if (impl_->entry_point == INVALID_NODE && impl_->n_vectors > 0) {
         uint32_t max_lvl = 0;
-        uint32_t max_node = 0;
+        uint32_t max_node = INVALID_NODE;
         for (size_t i = 0; i < new_levels.size(); ++i) {
-            if (new_levels[i] > max_lvl) {
+            if (new_node_ids[i] == INVALID_NODE) {
+                continue;
+            }
+            if (max_node == INVALID_NODE || new_levels[i] > max_lvl) {
                 max_lvl = new_levels[i];
-                max_node = static_cast<uint32_t>(start_id + i);
+                max_node = new_node_ids[i];
             }
         }
-        impl_->entry_point = max_node;
-        impl_->max_level = max_lvl;
+        if (max_node != INVALID_NODE) {
+            impl_->entry_point = max_node;
+            impl_->max_level = max_lvl;
+        }
+    }
+
+    const uint32_t entry_point = impl_->entry_point;
+    const int max_search_level = static_cast<int>(impl_->max_level);
+    const uint32_t target_threads = static_cast<uint32_t>(std::min<uint64_t>(inserted, n));
+    uint32_t num_threads = std::min(std::thread::hardware_concurrency(), target_threads);
+#ifdef _OPENMP
+    num_threads = std::min(num_threads, static_cast<uint32_t>(std::max(1, omp_get_max_threads())));
+#endif
+    if (num_threads == 0) num_threads = 1;
+
+    if (entry_point != INVALID_NODE && inserted > 1) {
+        BuildLockArray build_locks;
+
+        auto stripe_idx = [](uint32_t node_id) -> size_t {
+            return static_cast<size_t>(node_id) & (BUILD_LOCK_STRIPES - 1);
+        };
+
+        auto connect_node_parallel = [&](uint32_t node_id, uint32_t level) {
+            if (node_id == INVALID_NODE || node_id == entry_point) {
+                return;
+            }
+
+            const float* vec = impl_->get_vector(node_id);
+            std::vector<uint32_t> ep_set = {entry_point};
+
+            for (int lc = max_search_level; lc > static_cast<int>(level); --lc) {
+                auto results = impl_->search_layer(vec, static_cast<uint32_t>(lc), 1, ep_set, &build_locks);
+                if (!results.empty()) {
+                    ep_set = {results[0].second};
+                }
+            }
+
+            struct LayerSelection {
+                uint32_t layer = 0;
+                uint32_t max_conn = 0;
+                std::vector<uint32_t> neighbors;
+            };
+            std::vector<LayerSelection> selections;
+            selections.reserve(static_cast<size_t>(std::min(static_cast<int>(level), max_search_level) + 1));
+
+            for (int lc = std::min(static_cast<int>(level), max_search_level); lc >= 0; --lc) {
+                std::vector<std::pair<float, uint32_t>> candidates;
+                const uint32_t max_conn = (lc == 0) ? impl_->params.M * 2 : impl_->params.M;
+
+                auto results = impl_->search_layer(vec,
+                                                   static_cast<uint32_t>(lc),
+                                                   impl_->params.ef_construction,
+                                                   ep_set,
+                                                   &build_locks);
+                candidates.reserve(results.size());
+                for (const auto& r : results) {
+                    candidates.push_back(r);
+                }
+                impl_->select_neighbors_simple(candidates, max_conn);
+
+                LayerSelection sel;
+                sel.layer = static_cast<uint32_t>(lc);
+                sel.max_conn = max_conn;
+                sel.neighbors.reserve(candidates.size());
+                for (const auto& [_, n_id] : candidates) {
+                    sel.neighbors.push_back(n_id);
+                }
+                if (!sel.neighbors.empty()) {
+                    ep_set = sel.neighbors;
+                }
+                selections.push_back(std::move(sel));
+            }
+
+            for (const auto& sel : selections) {
+                const size_t node_stripe = stripe_idx(node_id);
+                {
+                    std::unique_lock<std::shared_mutex> guard(build_locks[node_stripe]);
+                    auto& node_neighbors = impl_->nodes[node_id].neighbors[sel.layer];
+                    node_neighbors.reserve(node_neighbors.size() + sel.neighbors.size());
+                    for (uint32_t n_id : sel.neighbors) {
+                        node_neighbors.push_back(n_id);
+                    }
+                }
+
+                for (uint32_t n_id : sel.neighbors) {
+                    const size_t neighbor_stripe = stripe_idx(n_id);
+                    std::unique_lock<std::shared_mutex> guard(build_locks[neighbor_stripe]);
+                    Node& neighbor_node = impl_->nodes[n_id];
+                    if (sel.layer >= static_cast<uint32_t>(neighbor_node.neighbors.size())) {
+                        neighbor_node.neighbors.resize(static_cast<size_t>(sel.layer) + 1);
+                    }
+                    auto& back_neighbors = neighbor_node.neighbors[sel.layer];
+                    back_neighbors.push_back(node_id);
+
+                    // Keep degree bounded but avoid expensive prune every append.
+                    if (back_neighbors.size() > (static_cast<size_t>(sel.max_conn) * 2)) {
+                        impl_->shrink_connections(n_id, sel.layer, sel.max_conn);
+                    }
+                }
+            }
+        };
+
+        if (inserted < 100 || num_threads == 1) {
+            for (uint64_t i = 0; i < n; ++i) {
+                if (new_node_ids[i] == INVALID_NODE) {
+                    continue;
+                }
+                connect_node_parallel(new_node_ids[i], new_levels[i]);
+            }
+        }
+#ifdef _OPENMP
+        else {
+#pragma omp parallel for schedule(dynamic, 64) num_threads(num_threads)
+            for (int64_t idx = 0; idx < static_cast<int64_t>(n); ++idx) {
+                const uint64_t uidx = static_cast<uint64_t>(idx);
+                if (new_node_ids[uidx] == INVALID_NODE) {
+                    continue;
+                }
+                connect_node_parallel(new_node_ids[uidx], new_levels[uidx]);
+            }
+        }
+#else
+        else {
+            std::atomic<uint64_t> next_idx{0};
+
+            auto worker = [&]() {
+                while (true) {
+                    const uint64_t idx = next_idx.fetch_add(1, std::memory_order_relaxed);
+                    if (idx >= n) break;
+                    if (new_node_ids[idx] == INVALID_NODE) {
+                        continue;
+                    }
+                    connect_node_parallel(new_node_ids[idx], new_levels[idx]);
+                }
+            };
+
+            std::vector<std::thread> threads;
+            threads.reserve(num_threads - 1);
+            for (uint32_t t = 0; t < num_threads - 1; ++t) {
+                threads.emplace_back(worker);
+            }
+            worker();
+
+            for (auto& t : threads) {
+                t.join();
+            }
+        }
+#endif
+    }
+
+    // Update entry point after connectivity has been established for the batch.
+    for (uint64_t i = 0; i < n; ++i) {
+        if (new_node_ids[i] == INVALID_NODE) {
+            continue;
+        }
+        if (new_levels[i] > impl_->max_level) {
+            impl_->max_level = new_levels[i];
+            impl_->entry_point = new_node_ids[i];
+        }
     }
 
     lock.unlock();
-
-    uint32_t num_threads = std::min(std::thread::hardware_concurrency(), static_cast<unsigned int>(n));
-    if (num_threads == 0) num_threads = 1;
-    
-    if (n < 100 || num_threads == 1) {
-        for (uint64_t i = 0; i < n; ++i) {
-            if (new_levels[i] == 0 && start_id + i == impl_->entry_point) continue;
-            connect_node(static_cast<uint32_t>(start_id + i), new_levels[i]);
-        }
-    } else {
-        std::atomic<uint64_t> next_idx{0};
-        
-        auto worker = [&]() {
-            while (true) {
-                uint64_t idx = next_idx.fetch_add(1);
-                if (idx >= n) break;
-                
-                uint32_t node_id = static_cast<uint32_t>(start_id + idx);
-                if (new_levels[idx] == 0 && node_id == impl_->entry_point) continue;
-                
-                connect_node(node_id, new_levels[idx]);
-            }
-        };
-        
-        std::vector<std::thread> threads;
-        threads.reserve(num_threads - 1);
-        for (uint32_t t = 0; t < num_threads - 1; ++t) {
-            threads.emplace_back(worker);
-        }
-        worker();
-        
-        for (auto& t : threads) {
-            t.join();
-        }
-    }
 
     return {};
 }
@@ -598,48 +816,60 @@ void IndexHNSW::connect_node(uint32_t node_id, uint32_t level) {
         }
     }
     
+    struct LayerSelection {
+        uint32_t layer = 0;
+        uint32_t max_conn = 0;
+        std::vector<uint32_t> neighbors;
+    };
+    std::vector<LayerSelection> selections;
+    selections.reserve(static_cast<size_t>(std::min(static_cast<int>(level), max_search_level) + 1));
+
     for (int lc = std::min(static_cast<int>(level), max_search_level); lc >= 0; --lc) {
-        std::vector<std::pair<float, uint32_t>> neighbors;
-        
+        std::vector<std::pair<float, uint32_t>> candidates;
+        uint32_t max_conn = (lc == 0) ? impl_->params.M * 2 : impl_->params.M;
+
         {
             std::shared_lock read_lock(impl_->mutex);
             auto results = impl_->search_layer(vec, static_cast<uint32_t>(lc), impl_->params.ef_construction, ep_set);
-            
-            uint32_t max_conn = (lc == 0) ? impl_->params.M * 2 : impl_->params.M;
-            
+            candidates.reserve(results.size());
             for (const auto& r : results) {
-                neighbors.push_back(r);
+                candidates.push_back(r);
             }
-            
-            impl_->select_neighbors_simple(neighbors, max_conn);
+            impl_->select_neighbors_simple(candidates, max_conn);
         }
-        
-        {
-            std::unique_lock write_lock(impl_->mutex);
-            
-            uint32_t max_conn = (lc == 0) ? impl_->params.M * 2 : impl_->params.M;
-            
-            impl_->nodes[node_id].neighbors[lc].reserve(neighbors.size());
-            for (const auto& [n_dist, n_id] : neighbors) {
-                impl_->nodes[node_id].neighbors[lc].push_back(n_id);
-                
+
+        LayerSelection sel;
+        sel.layer = static_cast<uint32_t>(lc);
+        sel.max_conn = max_conn;
+        sel.neighbors.reserve(candidates.size());
+        for (const auto& [_, n_id] : candidates) {
+            sel.neighbors.push_back(n_id);
+        }
+        if (!sel.neighbors.empty()) {
+            ep_set = sel.neighbors;
+        }
+        selections.push_back(std::move(sel));
+    }
+
+    {
+        std::unique_lock write_lock(impl_->mutex);
+        for (const auto& sel : selections) {
+            auto& node_neighbors = impl_->nodes[node_id].neighbors[sel.layer];
+            node_neighbors.reserve(node_neighbors.size() + sel.neighbors.size());
+            for (uint32_t n_id : sel.neighbors) {
+                node_neighbors.push_back(n_id);
+
                 Node& neighbor_node = impl_->nodes[n_id];
-                if (lc >= static_cast<int>(neighbor_node.neighbors.size())) {
-                    neighbor_node.neighbors.resize(lc + 1);
+                if (sel.layer >= static_cast<uint32_t>(neighbor_node.neighbors.size())) {
+                    neighbor_node.neighbors.resize(static_cast<size_t>(sel.layer) + 1);
                 }
-                neighbor_node.neighbors[lc].push_back(node_id);
-                
-                if (neighbor_node.neighbors[lc].size() > max_conn) {
-                    impl_->shrink_connections(n_id, static_cast<uint32_t>(lc), max_conn);
+                auto& back_neighbors = neighbor_node.neighbors[sel.layer];
+                back_neighbors.push_back(node_id);
+
+                // Defer pruning until adjacency grows well past target degree.
+                if (back_neighbors.size() > (static_cast<size_t>(sel.max_conn) * 2)) {
+                    impl_->shrink_connections(n_id, sel.layer, sel.max_conn);
                 }
-            }
-        }
-        
-        if (!neighbors.empty()) {
-            std::shared_lock read_lock(impl_->mutex);
-            ep_set.clear();
-            for (const auto& [dist, id] : neighbors) {
-                ep_set.push_back(id);
             }
         }
     }
