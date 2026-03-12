@@ -14,6 +14,12 @@ namespace cw {
 struct IndexOptions {
     Metric metric = Metric::L2;
     bool use_fp16 = true;
+    bool use_int8 = false;   // Quantize to int8; 4× storage reduction, faster GPU kernels.
+                              // use_int8 takes precedence over use_fp16 when both are set.
+                              // Requires Vulkan 1.2+ with shaderInt8 feature.
+    float int8_scale = 127.0f; // Quantization scale: quantized = clamp(round(v * int8_scale), -127, 127).
+                                // Default 127 assumes values in [-1, 1].
+                                // Set to 127 / max_abs_expected for your data distribution.
 };
 
 class IndexBase {

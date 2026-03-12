@@ -350,3 +350,107 @@ TEST_F(IndexHNSWTest, SerializationRoundTrip) {
 
     EXPECT_EQ(r1[0].id, r2[0].id);
 }
+
+TEST_F(IndexHNSWTest, Int8StorageNearestNeighbor) {
+    cw::HNSWParams params;
+    params.M = 16;
+    params.ef_construction = 200;
+    params.use_int8_storage = true;
+    params.int8_scale = 127.0f;
+
+    auto index = cw::IndexHNSW::create(32, params);
+    if (!index) { GTEST_SKIP() << "Failed to create int8 HNSW: " << index.error().message(); }
+    EXPECT_TRUE(index->valid());
+
+    constexpr uint32_t N = 500;
+    constexpr uint32_t DIM = 32;
+    std::vector<float> data(N * DIM, 0.0f);
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto& v : data) v = dist(rng);
+
+    // Normalize each vector so int8 scale of 127 makes sense.
+    for (uint32_t i = 0; i < N; ++i) {
+        float norm = 0.0f;
+        for (uint32_t d = 0; d < DIM; ++d) norm += data[i*DIM+d] * data[i*DIM+d];
+        norm = std::sqrt(norm);
+        if (norm > 1e-6f) for (uint32_t d = 0; d < DIM; ++d) data[i*DIM+d] /= norm;
+    }
+
+    auto add_result = index->add(data, N);
+    ASSERT_TRUE(add_result) << add_result.error().message();
+    EXPECT_EQ(index->size(), N);
+
+    // Exact copy of vector 42 as query — must be top result.
+    std::vector<float> query(data.begin() + 42*DIM, data.begin() + 43*DIM);
+    index->set_ef_search(200);
+    auto search_result = index->search(query, 5);
+    ASSERT_TRUE(search_result) << search_result.error().message();
+
+    auto results = (*search_result)[0];
+    ASSERT_FALSE(results.empty());
+    EXPECT_EQ(results[0].id, 42u);
+}
+
+TEST_F(IndexHNSWTest, Int8StorageL2Distance) {
+    cw::HNSWParams params;
+    params.M = 16;
+    params.ef_construction = 200;
+    params.use_int8_storage = true;
+    params.int8_scale = 64.0f;
+
+    // 8 orthogonal unit-ish vectors.
+    constexpr uint32_t DIM = 8;
+    auto index = cw::IndexHNSW::create(DIM, params,
+                                       cw::IndexOptions{cw::Metric::L2});
+    if (!index) { GTEST_SKIP() << "Failed: " << index.error().message(); }
+
+    std::vector<float> data(5 * DIM, 0.0f);
+    data[0] = 1.0f;
+    data[DIM + 1] = 1.0f;
+    data[2*DIM] = 0.5f; data[2*DIM+1] = 0.5f;
+    data[3*DIM] = -1.0f;
+    data[4*DIM + 7] = 1.0f;
+
+    auto add_result = index->add(data, 5);
+    ASSERT_TRUE(add_result) << add_result.error().message();
+
+    std::vector<float> query(DIM, 0.0f);
+    query[0] = 1.0f;
+    auto sr = index->search(query, 3);
+    ASSERT_TRUE(sr);
+    auto results = (*sr)[0];
+    EXPECT_EQ(results[0].id, 0u);
+    EXPECT_LT(results[0].distance, results[1].distance);
+}
+
+TEST_F(IndexHNSWTest, Int8StorageIPMetric) {
+    cw::HNSWParams params;
+    params.M = 16;
+    params.ef_construction = 200;
+    params.use_int8_storage = true;
+    params.int8_scale = 127.0f;
+
+    constexpr uint32_t DIM = 8;
+    auto index = cw::IndexHNSW::create(DIM, params,
+                                       cw::IndexOptions{cw::Metric::IP});
+    if (!index) { GTEST_SKIP() << "Failed: " << index.error().message(); }
+
+    std::vector<float> data(5 * DIM, 0.0f);
+    data[0] = 1.0f;
+    data[DIM + 1] = 1.0f;
+    data[2*DIM] = 0.707f; data[2*DIM+1] = 0.707f;
+    data[3*DIM] = -1.0f;
+    data[4*DIM + 7] = 1.0f;
+
+    auto add_result = index->add(data, 5);
+    ASSERT_TRUE(add_result) << add_result.error().message();
+
+    std::vector<float> query(DIM, 0.0f);
+    query[0] = 1.0f;
+    auto sr = index->search(query, 3);
+    ASSERT_TRUE(sr);
+    auto results = (*sr)[0];
+    EXPECT_EQ(results[0].id, 0u);
+    EXPECT_NEAR(results[0].distance, -1.0f, 0.05f);
+}

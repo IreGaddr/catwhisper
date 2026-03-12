@@ -101,6 +101,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         $<$<CONFIG:Release>:-mavx512dq>
         $<$<CONFIG:Release>:-mavx512vl>
         $<$<CONFIG:Release>:-mavx512bw>
+        $<$<CONFIG:Release>:-mavx512bf16>
         $<$<CONFIG:Release>:-mf16c>
         $<$<CONFIG:Release>:-mfma>
     )

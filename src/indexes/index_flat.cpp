@@ -104,6 +104,17 @@ static void convert_f32_to_f16_into(const float* __restrict__ src,
     }
 }
 
+// Float32 → int8 batch quantization.
+// quantized = clamp(round(v * scale), -127, 127)
+static void convert_f32_to_i8_into(const float* __restrict__ src,
+                                    int8_t*      __restrict__ dst,
+                                    uint32_t n, float scale) {
+    for (uint32_t i = 0; i < n; ++i) {
+        int q = static_cast<int>(std::lroundf(src[i] * scale));
+        dst[i] = static_cast<int8_t>(q < -127 ? -127 : q > 127 ? 127 : q);
+    }
+}
+
 // TOPK_CHUNK must match the CHUNK constant in topk_heap.comp and distance_topk_fused.comp.
 static constexpr uint32_t TOPK_CHUNK = 2048u;
 
@@ -117,6 +128,8 @@ struct IndexFlat::Impl {
     uint64_t capacity = 0;
     Metric metric = Metric::L2;
     bool use_fp16 = true;
+    bool use_int8 = false;
+    float int8_scale = 127.0f;
 
     Buffer data_buffer;
     Buffer ids_buffer;
@@ -151,12 +164,23 @@ struct IndexFlat::Impl {
     Buffer result_distances_buffer;
     Buffer result_indices_buffer;
 
-    // SoA maintenance pipelines
+    // SoA maintenance pipelines (fp16 / fp32)
     Pipeline transpose_add_pipeline;   // AoS staging → SoA database on add()
     DescriptorSet transpose_add_desc_set;
     Pipeline soa_repack_pipeline;      // SoA old-cap → new-cap on reallocate
     DescriptorSet soa_repack_desc_set;
-    Buffer staging_buffer;             // HostCoherent mapped; holds new fp16 AoS data
+    Buffer staging_buffer;             // HostCoherent mapped; holds new fp16/int8 AoS data
+
+    // int8 search + SoA maintenance pipelines
+    Pipeline fused_int8_l2_pipeline;
+    Pipeline fused_int8_ip_pipeline;
+    DescriptorSet fused_int8_desc_set;
+    Pipeline batch_int8_pipeline;
+    DescriptorSet batch_int8_desc_set;
+    Pipeline transpose_add_int8_pipeline;
+    DescriptorSet transpose_add_int8_desc_set;
+    Pipeline soa_repack_int8_pipeline;
+    DescriptorSet soa_repack_int8_desc_set;
 
     // Persistent command buffer for search (reused across calls)
     CommandBuffer search_cmd;
@@ -199,7 +223,10 @@ Expected<IndexFlat> IndexFlat::create(Context& ctx, uint32_t dimension,
     index.impl_->ctx = &ctx;
     index.impl_->dimension = dimension;
     index.impl_->metric = options.metric;
-    index.impl_->use_fp16 = options.use_fp16;
+    index.impl_->use_int8 = options.use_int8;
+    index.impl_->int8_scale = options.int8_scale;
+    // use_int8 takes precedence over use_fp16
+    index.impl_->use_fp16 = options.use_int8 ? false : options.use_fp16;
     
     auto pipeline_result = index.init_pipelines();
     if (!pipeline_result) {
@@ -411,6 +438,107 @@ Expected<void> IndexFlat::init_pipelines() {
     }
     impl_->soa_repack_desc_set = std::move(*soa_repack_desc_result);
 
+    // ---- int8 pipelines (only created when use_int8 is true) ----
+    if (impl_->use_int8) {
+        // Fused int8 distance + top-k (single query)
+        PipelineDesc fi8_desc;
+        fi8_desc.shader_name = "distance_topk_fused_int8";
+        fi8_desc.bindings = {
+            {0, DescriptorBinding::StorageBuffer},
+            {1, DescriptorBinding::StorageBuffer},
+            {2, DescriptorBinding::StorageBuffer},
+            {3, DescriptorBinding::StorageBuffer},
+        };
+        fi8_desc.push_constant_size = 24;  // n_vectors, dimension, k, metric, capacity, inv_scale2
+
+        auto fi8_l2 = Pipeline::create(*impl_->ctx, fi8_desc);
+        if (!fi8_l2) {
+            return make_unexpected(fi8_l2.error().code(),
+                                   "Failed to create fused int8 L2 pipeline: " + fi8_l2.error().message());
+        }
+        impl_->fused_int8_l2_pipeline = std::move(*fi8_l2);
+        impl_->fused_int8_ip_pipeline = std::move(*Pipeline::create(*impl_->ctx, fi8_desc));
+        if (!impl_->fused_int8_ip_pipeline.valid()) {
+            return make_unexpected(ErrorCode::OperationFailed, "Failed to create fused int8 IP pipeline");
+        }
+
+        auto fi8_desc_r = DescriptorSet::create(*impl_->ctx, impl_->fused_int8_l2_pipeline);
+        if (!fi8_desc_r) {
+            return make_unexpected(fi8_desc_r.error().code(), "Failed to create fused int8 descriptor set");
+        }
+        impl_->fused_int8_desc_set = std::move(*fi8_desc_r);
+
+        // Batch int8
+        PipelineDesc bi8_desc;
+        bi8_desc.shader_name = "distance_topk_batch_int8";
+        bi8_desc.bindings = {
+            {0, DescriptorBinding::StorageBuffer},
+            {1, DescriptorBinding::StorageBuffer},
+            {2, DescriptorBinding::StorageBuffer},
+            {3, DescriptorBinding::StorageBuffer},
+        };
+        bi8_desc.push_constant_size = 28;  // n_vectors, dimension, k, n_queries, metric, capacity, inv_scale2
+
+        auto bi8 = Pipeline::create(*impl_->ctx, bi8_desc);
+        if (!bi8) {
+            return make_unexpected(bi8.error().code(),
+                                   "Failed to create batch int8 pipeline: " + bi8.error().message());
+        }
+        impl_->batch_int8_pipeline = std::move(*bi8);
+
+        auto bi8_desc_r = DescriptorSet::create(*impl_->ctx, impl_->batch_int8_pipeline);
+        if (!bi8_desc_r) {
+            return make_unexpected(bi8_desc_r.error().code(), "Failed to create batch int8 descriptor set");
+        }
+        impl_->batch_int8_desc_set = std::move(*bi8_desc_r);
+
+        // Transpose add int8
+        PipelineDesc ta_i8_desc;
+        ta_i8_desc.shader_name = "transpose_add_int8";
+        ta_i8_desc.bindings = {
+            {0, DescriptorBinding::StorageBuffer},
+            {1, DescriptorBinding::StorageBuffer},
+        };
+        ta_i8_desc.push_constant_size = 16;
+
+        auto ta_i8 = Pipeline::create(*impl_->ctx, ta_i8_desc);
+        if (!ta_i8) {
+            return make_unexpected(ta_i8.error().code(),
+                                   "Failed to create transpose_add_int8 pipeline: " + ta_i8.error().message());
+        }
+        impl_->transpose_add_int8_pipeline = std::move(*ta_i8);
+
+        auto ta_i8_desc_r = DescriptorSet::create(*impl_->ctx, impl_->transpose_add_int8_pipeline);
+        if (!ta_i8_desc_r) {
+            return make_unexpected(ta_i8_desc_r.error().code(),
+                                   "Failed to create transpose_add_int8 descriptor set");
+        }
+        impl_->transpose_add_int8_desc_set = std::move(*ta_i8_desc_r);
+
+        // SoA repack int8
+        PipelineDesc sr_i8_desc;
+        sr_i8_desc.shader_name = "soa_repack_int8";
+        sr_i8_desc.bindings = {
+            {0, DescriptorBinding::StorageBuffer},
+            {1, DescriptorBinding::StorageBuffer},
+        };
+        sr_i8_desc.push_constant_size = 16;
+
+        auto sr_i8 = Pipeline::create(*impl_->ctx, sr_i8_desc);
+        if (!sr_i8) {
+            return make_unexpected(sr_i8.error().code(),
+                                   "Failed to create soa_repack_int8 pipeline: " + sr_i8.error().message());
+        }
+        impl_->soa_repack_int8_pipeline = std::move(*sr_i8);
+
+        auto sr_i8_desc_r = DescriptorSet::create(*impl_->ctx, impl_->soa_repack_int8_pipeline);
+        if (!sr_i8_desc_r) {
+            return make_unexpected(sr_i8_desc_r.error().code(),
+                                   "Failed to create soa_repack_int8 descriptor set");
+        }
+        impl_->soa_repack_int8_desc_set = std::move(*sr_i8_desc_r);
+    }
+
     return {};
 }
 
@@ -459,7 +587,9 @@ Expected<void> IndexFlat::add(std::span<const float> data, uint64_t n,
     }
     
     // ---- Ensure staging buffer is large enough ----
-    uint64_t element_size = impl_->use_fp16 ? sizeof(uint16_t) : sizeof(float);
+    uint64_t element_size = impl_->use_int8 ? sizeof(int8_t)
+                          : impl_->use_fp16  ? sizeof(uint16_t)
+                          :                    sizeof(float);
     uint64_t staging_size = n * impl_->dimension * element_size;
     
     if (!impl_->staging_buffer.valid() || impl_->staging_buffer.size() < staging_size) {
@@ -476,40 +606,49 @@ Expected<void> IndexFlat::add(std::span<const float> data, uint64_t n,
         impl_->staging_buffer = std::move(*sbuf);
     }
     
-    // ---- Convert to fp16 and upload to staging (AoS layout) ----
-    std::vector<uint8_t> fp16_data;
-    if (impl_->use_fp16) {
-        fp16_data.resize(n * impl_->dimension * sizeof(uint16_t));
-        uint16_t* fp16_ptr = reinterpret_cast<uint16_t*>(fp16_data.data());
-        for (uint64_t i = 0; i < n * impl_->dimension; ++i) {
-            fp16_ptr[i] = float_to_half(data[i]);
-        }
+    // ---- Quantize / convert and upload to staging (AoS layout) ----
+    std::vector<uint8_t> staged_data;
+    if (impl_->use_int8) {
+        staged_data.resize(n * impl_->dimension * sizeof(int8_t));
+        int8_t* dst = reinterpret_cast<int8_t*>(staged_data.data());
+        convert_f32_to_i8_into(data.data(), dst,
+                                static_cast<uint32_t>(n * impl_->dimension), impl_->int8_scale);
+    } else if (impl_->use_fp16) {
+        staged_data.resize(n * impl_->dimension * sizeof(uint16_t));
+        uint16_t* fp16_ptr = reinterpret_cast<uint16_t*>(staged_data.data());
+        convert_f32_to_f16_into(data.data(), fp16_ptr,
+                                 static_cast<uint32_t>(n * impl_->dimension));
     } else {
-        fp16_data.resize(n * impl_->dimension * sizeof(float));
-        std::memcpy(fp16_data.data(), data.data(), fp16_data.size());
+        staged_data.resize(n * impl_->dimension * sizeof(float));
+        std::memcpy(staged_data.data(), data.data(), staged_data.size());
     }
-    
-    auto upload_result = impl_->staging_buffer.upload(fp16_data);
+
+    auto upload_result = impl_->staging_buffer.upload(staged_data);
     if (!upload_result) {
         return upload_result;
     }
-    
-    // ---- Dispatch transpose_add shader ----
-    auto bind_result = impl_->transpose_add_desc_set.bind_buffer(0, impl_->staging_buffer);
+
+    // ---- Dispatch transpose_add shader (int8 or fp16/fp32 variant) ----
+    Pipeline& ta_pl = impl_->use_int8 ? impl_->transpose_add_int8_pipeline
+                                       : impl_->transpose_add_pipeline;
+    DescriptorSet& ta_ds = impl_->use_int8 ? impl_->transpose_add_int8_desc_set
+                                            : impl_->transpose_add_desc_set;
+
+    auto bind_result = ta_ds.bind_buffer(0, impl_->staging_buffer);
     if (!bind_result) {
         return make_unexpected(bind_result.error().code(), bind_result.error().message());
     }
-    bind_result = impl_->transpose_add_desc_set.bind_buffer(1, impl_->data_buffer);
+    bind_result = ta_ds.bind_buffer(1, impl_->data_buffer);
     if (!bind_result) {
         return make_unexpected(bind_result.error().code(), bind_result.error().message());
     }
-    
+
     auto cmd_result = CommandBuffer::create(*impl_->ctx);
     if (!cmd_result) {
         return make_unexpected(cmd_result.error().code(), cmd_result.error().message());
     }
     auto cmd = std::move(*cmd_result);
-    
+
     struct TransposePushConstants {
         uint32_t n_new;
         uint32_t dim;
@@ -521,11 +660,11 @@ Expected<void> IndexFlat::add(std::span<const float> data, uint64_t n,
         static_cast<uint32_t>(impl_->n_vectors),
         static_cast<uint32_t>(impl_->capacity)
     };
-    
+
     cmd.begin();
-    cmd.bind_pipeline(impl_->transpose_add_pipeline);
-    cmd.bind_descriptor_set(impl_->transpose_add_pipeline, impl_->transpose_add_desc_set);
-    cmd.push_constants(impl_->transpose_add_pipeline, &tpc, sizeof(tpc));
+    cmd.bind_pipeline(ta_pl);
+    cmd.bind_descriptor_set(ta_pl, ta_ds);
+    cmd.push_constants(ta_pl, &tpc, sizeof(tpc));
     
     uint64_t total_elements = n * impl_->dimension;
     uint32_t n_wg = static_cast<uint32_t>((total_elements + 255) / 256);
@@ -552,7 +691,9 @@ Expected<void> IndexFlat::add(std::span<const float> data, uint64_t n,
 }
 
 Expected<void> IndexFlat::reallocate_buffers(uint64_t new_capacity) {
-    uint64_t element_size = impl_->use_fp16 ? sizeof(uint16_t) : sizeof(float);
+    uint64_t element_size = impl_->use_int8 ? sizeof(int8_t)
+                          : impl_->use_fp16  ? sizeof(uint16_t)
+                          :                    sizeof(float);
     uint64_t data_size = new_capacity * impl_->dimension * element_size;
     
     BufferDesc data_desc = {};
@@ -568,21 +709,26 @@ Expected<void> IndexFlat::reallocate_buffers(uint64_t new_capacity) {
     
     if (impl_->data_buffer.valid() && impl_->n_vectors > 0) {
         // ---- Use soa_repack shader for SoA -> SoA copy with stride change ----
-        auto bind_result = impl_->soa_repack_desc_set.bind_buffer(0, impl_->data_buffer);
+        Pipeline& repack_pl = impl_->use_int8 ? impl_->soa_repack_int8_pipeline
+                                               : impl_->soa_repack_pipeline;
+        DescriptorSet& repack_ds = impl_->use_int8 ? impl_->soa_repack_int8_desc_set
+                                                    : impl_->soa_repack_desc_set;
+
+        auto bind_result = repack_ds.bind_buffer(0, impl_->data_buffer);
         if (!bind_result) {
             return make_unexpected(bind_result.error().code(), bind_result.error().message());
         }
-        bind_result = impl_->soa_repack_desc_set.bind_buffer(1, *new_data);
+        bind_result = repack_ds.bind_buffer(1, *new_data);
         if (!bind_result) {
             return make_unexpected(bind_result.error().code(), bind_result.error().message());
         }
-        
+
         auto cmd_result = CommandBuffer::create(*impl_->ctx);
         if (!cmd_result) {
             return make_unexpected(cmd_result.error().code(), cmd_result.error().message());
         }
         auto cmd = std::move(*cmd_result);
-        
+
         struct RepackPushConstants {
             uint32_t n_vectors;
             uint32_t dim;
@@ -594,11 +740,11 @@ Expected<void> IndexFlat::reallocate_buffers(uint64_t new_capacity) {
             static_cast<uint32_t>(impl_->capacity),
             static_cast<uint32_t>(new_capacity)
         };
-        
+
         cmd.begin();
-        cmd.bind_pipeline(impl_->soa_repack_pipeline);
-        cmd.bind_descriptor_set(impl_->soa_repack_pipeline, impl_->soa_repack_desc_set);
-        cmd.push_constants(impl_->soa_repack_pipeline, &rpc, sizeof(rpc));
+        cmd.bind_pipeline(repack_pl);
+        cmd.bind_descriptor_set(repack_pl, repack_ds);
+        cmd.push_constants(repack_pl, &rpc, sizeof(rpc));
         
         uint64_t total_elements = impl_->n_vectors * impl_->dimension;
         uint32_t n_wg = static_cast<uint32_t>((total_elements + 255) / 256);
@@ -634,8 +780,10 @@ Expected<SearchResults> IndexFlat::search(Vector query, uint32_t k) {
     SearchResults results(1, k);
     
     // ---- Ensure query buffer exists and is large enough ----
-    uint64_t element_size = impl_->use_fp16 ? sizeof(uint16_t) : sizeof(float);
-    
+    uint64_t element_size = impl_->use_int8 ? sizeof(int8_t)
+                          : impl_->use_fp16  ? sizeof(uint16_t)
+                          :                    sizeof(float);
+
     if (!impl_->query_buffer.valid() || impl_->query_buffer.size() < impl_->dimension * element_size) {
         BufferDesc query_desc = {};
         query_desc.size = impl_->dimension * element_size;
@@ -655,11 +803,13 @@ Expected<SearchResults> IndexFlat::search(Vector query, uint32_t k) {
     }
     
     // ---- Write query directly into the persistently-mapped HostCoherent buffer ----
-    // Eliminates one heap allocation + one memcpy vs the old vector<uint8_t> approach.
-    // HostCoherent writes are immediately visible to the GPU without explicit flushing.
     {
         void* mapped_q = impl_->query_buffer.mapped();
-        if (impl_->use_fp16) {
+        if (impl_->use_int8) {
+            convert_f32_to_i8_into(query.data(),
+                                   reinterpret_cast<int8_t*>(mapped_q),
+                                   impl_->dimension, impl_->int8_scale);
+        } else if (impl_->use_fp16) {
             convert_f32_to_f16_into(query.data(),
                                     reinterpret_cast<uint16_t*>(mapped_q),
                                     impl_->dimension);
@@ -705,8 +855,10 @@ Expected<SearchResults> IndexFlat::search(Vector query, uint32_t k) {
     }
 
     // ---- Update descriptor set only when VkBuffer handles change ----
-    // Use AMD descriptor set if AMD pipeline is available
-    DescriptorSet& active_desc_set = impl_->amd_available ? impl_->amd_desc_set : impl_->fused_desc_set;
+    // int8 > AMD > standard fused
+    DescriptorSet& active_desc_set = impl_->use_int8      ? impl_->fused_int8_desc_set
+                                   : impl_->amd_available ? impl_->amd_desc_set
+                                   :                        impl_->fused_desc_set;
     
     // submit_and_wait guarantees the previous submission has completed before we
     // reach this point, so the descriptor set is not "in use" and
@@ -747,10 +899,12 @@ Expected<SearchResults> IndexFlat::search(Vector query, uint32_t k) {
         }
     }
 
-    // ---- Select pipeline based on metric and AMD availability ----
-    Pipeline& fused_pipeline = impl_->amd_available
-        ? ((impl_->metric == Metric::IP) ? impl_->amd_ip_pipeline : impl_->amd_l2_pipeline)
-        : ((impl_->metric == Metric::IP) ? impl_->fused_ip_pipeline : impl_->fused_l2_pipeline);
+    // ---- Select pipeline based on int8 > AMD > standard fused ----
+    Pipeline& fused_pipeline = impl_->use_int8
+        ? ((impl_->metric == Metric::IP) ? impl_->fused_int8_ip_pipeline : impl_->fused_int8_l2_pipeline)
+        : impl_->amd_available
+            ? ((impl_->metric == Metric::IP) ? impl_->amd_ip_pipeline : impl_->amd_l2_pipeline)
+            : ((impl_->metric == Metric::IP) ? impl_->fused_ip_pipeline : impl_->fused_l2_pipeline);
 
     // ---- Record or reuse command buffer ----
     // need_rerecord is true on first call, when k changes, when n_vectors changes,
@@ -780,20 +934,39 @@ Expected<SearchResults> IndexFlat::search(Vector query, uint32_t k) {
         impl_->search_cmd.bind_pipeline(fused_pipeline);
         impl_->search_cmd.bind_descriptor_set(fused_pipeline, active_desc_set);
 
-        struct FusedPushConstants {
-            uint32_t n_vectors;
-            uint32_t dimension;
-            uint32_t k;
-            uint32_t metric;  // 0 = L2, 1 = IP
-            uint32_t capacity;
-        } fpc = {
-            static_cast<uint32_t>(impl_->n_vectors),
-            impl_->dimension,
-            k,
-            (impl_->metric == Metric::IP) ? 1u : 0u,
-            static_cast<uint32_t>(impl_->capacity)
-        };
-        impl_->search_cmd.push_constants(fused_pipeline, &fpc, sizeof(fpc));
+        if (impl_->use_int8) {
+            struct FusedInt8PushConstants {
+                uint32_t n_vectors;
+                uint32_t dimension;
+                uint32_t k;
+                uint32_t metric;
+                uint32_t capacity;
+                float    inv_scale2;
+            } fpc = {
+                static_cast<uint32_t>(impl_->n_vectors),
+                impl_->dimension,
+                k,
+                (impl_->metric == Metric::IP) ? 1u : 0u,
+                static_cast<uint32_t>(impl_->capacity),
+                1.0f / (impl_->int8_scale * impl_->int8_scale)
+            };
+            impl_->search_cmd.push_constants(fused_pipeline, &fpc, sizeof(fpc));
+        } else {
+            struct FusedPushConstants {
+                uint32_t n_vectors;
+                uint32_t dimension;
+                uint32_t k;
+                uint32_t metric;
+                uint32_t capacity;
+            } fpc = {
+                static_cast<uint32_t>(impl_->n_vectors),
+                impl_->dimension,
+                k,
+                (impl_->metric == Metric::IP) ? 1u : 0u,
+                static_cast<uint32_t>(impl_->capacity)
+            };
+            impl_->search_cmd.push_constants(fused_pipeline, &fpc, sizeof(fpc));
+        }
         impl_->search_cmd.dispatch(n_topk_wg);
         impl_->search_cmd.end();
 
@@ -867,8 +1040,10 @@ Expected<SearchResults> IndexFlat::search(std::span<const float> queries,
     }
     
     SearchResults results(n_queries, k);
-    uint64_t element_size = impl_->use_fp16 ? sizeof(uint16_t) : sizeof(float);
-    
+    uint64_t element_size = impl_->use_int8 ? sizeof(int8_t)
+                          : impl_->use_fp16  ? sizeof(uint16_t)
+                          :                    sizeof(float);
+
     // ---- Allocate batch query buffer ----
     uint64_t batch_query_size = n_queries * impl_->dimension * element_size;
     if (!impl_->batch_query_buffer.valid() || impl_->batch_query_buffer.size() < batch_query_size) {
@@ -883,16 +1058,19 @@ Expected<SearchResults> IndexFlat::search(std::span<const float> queries,
         impl_->batch_query_buffer = std::move(*qbuf);
     }
     
-    // ---- Upload all queries ----
+    // ---- Upload all queries (quantized / converted) ----
     std::vector<uint8_t> query_bytes;
-    if (impl_->use_fp16) {
+    if (impl_->use_int8) {
+        query_bytes.resize(n_queries * impl_->dimension * sizeof(int8_t));
+        int8_t* dst = reinterpret_cast<int8_t*>(query_bytes.data());
+        convert_f32_to_i8_into(queries.data(), dst,
+                                static_cast<uint32_t>(n_queries * impl_->dimension),
+                                impl_->int8_scale);
+    } else if (impl_->use_fp16) {
         query_bytes.resize(n_queries * impl_->dimension * sizeof(uint16_t));
         uint16_t* fp16_ptr = reinterpret_cast<uint16_t*>(query_bytes.data());
-        for (uint64_t q = 0; q < n_queries; ++q) {
-            for (uint32_t d = 0; d < impl_->dimension; ++d) {
-                fp16_ptr[q * impl_->dimension + d] = float_to_half(queries[q * impl_->dimension + d]);
-            }
-        }
+        convert_f32_to_f16_into(queries.data(), fp16_ptr,
+                                 static_cast<uint32_t>(n_queries * impl_->dimension));
     } else {
         query_bytes.resize(n_queries * impl_->dimension * sizeof(float));
         std::memcpy(query_bytes.data(), queries.data(), query_bytes.size());
@@ -926,40 +1104,64 @@ Expected<SearchResults> IndexFlat::search(std::span<const float> queries,
         impl_->batch_result_indices_buffer = std::move(*ribuf);
     }
     
-    // ---- Bind descriptor set ----
-    auto bind_result = impl_->batch_desc_set.bind_buffer(0, impl_->data_buffer);
+    // ---- Bind descriptor set (int8 or standard batch) ----
+    Pipeline& active_batch_pl = impl_->use_int8 ? impl_->batch_int8_pipeline : impl_->batch_pipeline;
+    DescriptorSet& active_batch_ds = impl_->use_int8 ? impl_->batch_int8_desc_set : impl_->batch_desc_set;
+
+    auto bind_result = active_batch_ds.bind_buffer(0, impl_->data_buffer);
     if (!bind_result) return make_unexpected(bind_result.error().code(), bind_result.error().message());
-    bind_result = impl_->batch_desc_set.bind_buffer(1, impl_->batch_query_buffer);
+    bind_result = active_batch_ds.bind_buffer(1, impl_->batch_query_buffer);
     if (!bind_result) return make_unexpected(bind_result.error().code(), bind_result.error().message());
-    bind_result = impl_->batch_desc_set.bind_buffer(2, impl_->batch_result_distances_buffer);
+    bind_result = active_batch_ds.bind_buffer(2, impl_->batch_result_distances_buffer);
     if (!bind_result) return make_unexpected(bind_result.error().code(), bind_result.error().message());
-    bind_result = impl_->batch_desc_set.bind_buffer(3, impl_->batch_result_indices_buffer);
+    bind_result = active_batch_ds.bind_buffer(3, impl_->batch_result_indices_buffer);
     if (!bind_result) return make_unexpected(bind_result.error().code(), bind_result.error().message());
-    
+
     // ---- Record and submit command buffer ----
     auto cmd_result = CommandBuffer::create(*impl_->ctx);
     if (!cmd_result) return make_unexpected(cmd_result.error().code(), cmd_result.error().message());
     auto cmd = std::move(*cmd_result);
     cmd.begin();
-    cmd.bind_pipeline(impl_->batch_pipeline);
-    cmd.bind_descriptor_set(impl_->batch_pipeline, impl_->batch_desc_set);
+    cmd.bind_pipeline(active_batch_pl);
+    cmd.bind_descriptor_set(active_batch_pl, active_batch_ds);
     
-    struct BatchPushConstants {
-        uint32_t n_vectors;
-        uint32_t dimension;
-        uint32_t k;
-        uint32_t n_queries;
-        uint32_t metric;
-        uint32_t capacity;
-    } bpc = {
-        static_cast<uint32_t>(impl_->n_vectors),
-        impl_->dimension,
-        k,
-        static_cast<uint32_t>(n_queries),
-        (impl_->metric == Metric::IP) ? 1u : 0u,
-        static_cast<uint32_t>(impl_->capacity)
-    };
-    cmd.push_constants(impl_->batch_pipeline, &bpc, sizeof(bpc));
+    if (impl_->use_int8) {
+        struct BatchInt8PushConstants {
+            uint32_t n_vectors;
+            uint32_t dimension;
+            uint32_t k;
+            uint32_t n_queries;
+            uint32_t metric;
+            uint32_t capacity;
+            float    inv_scale2;
+        } bpc = {
+            static_cast<uint32_t>(impl_->n_vectors),
+            impl_->dimension,
+            k,
+            static_cast<uint32_t>(n_queries),
+            (impl_->metric == Metric::IP) ? 1u : 0u,
+            static_cast<uint32_t>(impl_->capacity),
+            1.0f / (impl_->int8_scale * impl_->int8_scale)
+        };
+        cmd.push_constants(active_batch_pl, &bpc, sizeof(bpc));
+    } else {
+        struct BatchPushConstants {
+            uint32_t n_vectors;
+            uint32_t dimension;
+            uint32_t k;
+            uint32_t n_queries;
+            uint32_t metric;
+            uint32_t capacity;
+        } bpc = {
+            static_cast<uint32_t>(impl_->n_vectors),
+            impl_->dimension,
+            k,
+            static_cast<uint32_t>(n_queries),
+            (impl_->metric == Metric::IP) ? 1u : 0u,
+            static_cast<uint32_t>(impl_->capacity)
+        };
+        cmd.push_constants(active_batch_pl, &bpc, sizeof(bpc));
+    }
     cmd.dispatch(n_wg_x, static_cast<uint32_t>(n_queries), 1);
     cmd.end();
     

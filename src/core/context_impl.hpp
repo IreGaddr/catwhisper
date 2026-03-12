@@ -232,11 +232,12 @@ private:
         queue_info.queueCount = 1;
         queue_info.pQueuePriorities = &queue_priority;
 
-        // Vulkan 1.2 features: timeline semaphores + fp16 arithmetic
+        // Vulkan 1.2 features: timeline semaphores + fp16/int8 arithmetic
         VkPhysicalDeviceVulkan12Features vk12_features = {};
         vk12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
         vk12_features.timelineSemaphore = VK_TRUE;
         vk12_features.shaderFloat16    = VK_TRUE;
+        vk12_features.shaderInt8       = VK_TRUE;
 
         // Vulkan 1.3 features: scalar block layout, synchronized texture access
         VkPhysicalDeviceVulkan13Features vk13_features = {};

@@ -437,3 +437,89 @@ TEST_F(IndexFlatTest, SearchManyWorkgroups) {
             << "Not sorted at position " << i;
     }
 }
+
+TEST_F(IndexFlatTest, Int8NearestNeighbor) {
+    if (!ctx_) GTEST_SKIP() << "No GPU context";
+
+    cw::IndexOptions opts{cw::Metric::L2, false, true, 127.0f};
+    auto index_result = cw::IndexFlat::create(*ctx_, 32, opts);
+    if (!index_result) { GTEST_SKIP() << "Int8 IndexFlat not available: " << index_result.error().message(); }
+
+    constexpr uint32_t N = 1000;
+    constexpr uint32_t DIM = 32;
+    std::vector<float> data(N * DIM);
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto& v : data) v = dist(rng);
+
+    auto add_result = index_result->add(data, N);
+    ASSERT_TRUE(add_result) << add_result.error().message();
+
+    // Query = exact copy of vector 77.
+    std::vector<float> query(data.begin() + 77*DIM, data.begin() + 78*DIM);
+    auto sr = index_result->search(query, 5);
+    ASSERT_TRUE(sr) << sr.error().message();
+
+    auto results = (*sr)[0];
+    ASSERT_GE(results.size(), 1u);
+    EXPECT_EQ(results[0].id, 77u);
+    EXPECT_NEAR(results[0].distance, 0.0f, 1.0f);  // int8 quantization allows small error
+}
+
+TEST_F(IndexFlatTest, Int8IPMetric) {
+    if (!ctx_) GTEST_SKIP() << "No GPU context";
+
+    cw::IndexOptions opts{cw::Metric::IP, false, true, 127.0f};
+    auto index_result = cw::IndexFlat::create(*ctx_, 8, opts);
+    if (!index_result) { GTEST_SKIP() << "Int8 IP IndexFlat not available: " << index_result.error().message(); }
+
+    std::vector<float> data(5 * 8, 0.0f);
+    data[0] = 1.0f;
+    data[8 + 1] = 1.0f;
+    data[16] = 0.707f; data[17] = 0.707f;
+    data[24] = -1.0f;
+    data[32 + 7] = 1.0f;
+
+    auto add_result = index_result->add(data, 5);
+    ASSERT_TRUE(add_result) << add_result.error().message();
+
+    std::vector<float> query(8, 0.0f);
+    query[0] = 1.0f;
+    auto sr = index_result->search(query, 3);
+    ASSERT_TRUE(sr) << sr.error().message();
+
+    auto results = (*sr)[0];
+    ASSERT_GE(results.size(), 1u);
+    EXPECT_EQ(results[0].id, 0u);
+    EXPECT_NEAR(results[0].distance, -1.0f, 0.05f);
+}
+
+TEST_F(IndexFlatTest, Int8BatchSearch) {
+    if (!ctx_) GTEST_SKIP() << "No GPU context";
+
+    cw::IndexOptions opts{cw::Metric::L2, false, true, 127.0f};
+    auto index_result = cw::IndexFlat::create(*ctx_, 32, opts);
+    if (!index_result) { GTEST_SKIP() << "Int8 IndexFlat not available: " << index_result.error().message(); }
+
+    constexpr uint32_t N = 500;
+    constexpr uint32_t DIM = 32;
+    std::vector<float> data(N * DIM);
+    std::mt19937 rng(13);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (auto& v : data) v = dist(rng);
+
+    auto add_result = index_result->add(data, N);
+    ASSERT_TRUE(add_result) << add_result.error().message();
+
+    // Two queries: exact copies of vec 10 and vec 20.
+    std::vector<float> queries(2 * DIM);
+    std::copy(data.begin() + 10*DIM, data.begin() + 11*DIM, queries.begin());
+    std::copy(data.begin() + 20*DIM, data.begin() + 21*DIM, queries.begin() + DIM);
+
+    auto sr = index_result->search(queries, 2, 5);
+    ASSERT_TRUE(sr) << sr.error().message();
+
+    ASSERT_EQ(sr->n_queries, 2u);
+    EXPECT_EQ((*sr)[0][0].id, 10u);
+    EXPECT_EQ((*sr)[1][0].id, 20u);
+}

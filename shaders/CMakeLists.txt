@@ -14,8 +14,12 @@ set(SHADER_SOURCES
     distance_topk_fused.comp
     distance_topk_batch.comp
     distance_topk_amd.comp
+    distance_topk_fused_int8.comp
+    distance_topk_batch_int8.comp
     transpose_add.comp
+    transpose_add_int8.comp
     soa_repack.comp
+    soa_repack_int8.comp
     ivf_distance.comp
     assign_clusters.comp
     pq_distance.comp

@@ -94,6 +94,15 @@ Expected<Buffer> Buffer::create(Context& ctx, const BufferDesc& desc) {
             // No DEVICE_LOCAL flag so GPU writes go through PCIe; CPU reads are cached.
             vma_usage = VMA_MEMORY_USAGE_GPU_TO_CPU;
             break;
+        case MemoryType::Unified:
+            // VMA selects the best heap for CPU-write / GPU-read access.
+            // On APUs (e.g. Radeon 780M with unified DDR5) this lands in
+            // DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT — zero-copy: no staging needed.
+            // On discrete GPUs VMA falls back to host-visible PCIe-accessible memory.
+            vma_usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+            vma_flags |= VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+                       | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+            break;
         default:
             vma_usage = VMA_MEMORY_USAGE_GPU_ONLY;
     }

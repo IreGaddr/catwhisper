@@ -12,7 +12,14 @@ namespace cw {
 struct HNSWParams {
     uint32_t M = 16;                      // Max connections per node (layer >= 1)
     uint32_t ef_construction = 200;       // Candidate list size during construction
-    float ml_factor = 0.0f;               // Level multiplier (0 = auto: 1/ln(M))
+    float ml_factor = 0.0f;              // Level multiplier (0 = auto: 1/ln(M))
+    bool use_bf16_storage = false;        // Store vectors as BF16; halves CPU search bandwidth.
+                                          // Requires __AVX512BF16__ for fast conversion path.
+                                          // float data is always kept for GPU upload.
+    bool use_int8_storage = false;        // Store vectors as symmetric int8; 4× storage reduction.
+                                          // use_int8_storage takes precedence over use_bf16_storage.
+    float int8_scale = 127.0f;            // Quantization scale: quantized = clamp(round(v * int8_scale), -127, 127).
+                                          // Default 127 assumes values in [-1, 1].
 };
 
 struct HNSWGPUOptions {

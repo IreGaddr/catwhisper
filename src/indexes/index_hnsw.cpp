@@ -9,6 +9,7 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <numeric>
 #include <queue>
 #include <set>
 #include <unordered_set>
@@ -47,6 +48,12 @@ struct IndexHNSW::Impl {
     HNSWParams params;
     std::vector<Node> nodes;
     std::vector<float> data;
+    std::vector<uint16_t> data_bf16;  // BF16-compressed copy of data; populated when
+                                       // params.use_bf16_storage is true. Halves the
+                                       // memory read per CPU distance computation.
+    std::vector<int8_t>  data_int8;   // int8-quantized copy; populated when
+                                       // params.use_int8_storage is true. 4× vs fp32.
+    float int8_scale = 127.0f;         // = params.int8_scale; quantized = clamp(round(v * scale))
     std::vector<VectorId> id_mapping;
     std::unordered_set<VectorId> id_set;
 
@@ -70,62 +77,60 @@ struct IndexHNSW::Impl {
     float distance(const float* a, const float* b) const {
 #if defined(__AVX512F__)
         float result = 0.0f;
-        const float* end = a + dimension;
-        
+        const float* pa = a;
+        const float* pb = b;
+        const float* end = pa + dimension;
+
         __m512 sum = _mm512_setzero_ps();
-        
-        while (a + 16 <= end) {
-            __m512 va = _mm512_loadu_ps(a);
-            __m512 vb = _mm512_loadu_ps(b);
-            __m512 diff = _mm512_sub_ps(va, vb);
-            sum = _mm512_fmadd_ps(diff, diff, sum);
-            a += 16;
-            b += 16;
-        }
-        
-        result = _mm512_reduce_add_ps(sum);
-        
-        while (a < end) {
-            float d = *a - *b;
-            result += d * d;
-            ++a;
-            ++b;
-        }
-        
+
         if (metric == Metric::IP) {
+            while (pa + 16 <= end) {
+                sum = _mm512_fmadd_ps(_mm512_loadu_ps(pa), _mm512_loadu_ps(pb), sum);
+                pa += 16; pb += 16;
+            }
+            result = _mm512_reduce_add_ps(sum);
+            while (pa < end) { result += (*pa++) * (*pb++); }
             return -result;
+        } else {
+            while (pa + 16 <= end) {
+                __m512 diff = _mm512_sub_ps(_mm512_loadu_ps(pa), _mm512_loadu_ps(pb));
+                sum = _mm512_fmadd_ps(diff, diff, sum);
+                pa += 16; pb += 16;
+            }
+            result = _mm512_reduce_add_ps(sum);
+            while (pa < end) { float d = (*pa++) - (*pb++); result += d * d; }
+            return result;
         }
-        return result;
 #elif defined(__AVX2__)
         float result = 0.0f;
-        const float* end = a + dimension;
-        
+        const float* pa = a;
+        const float* pb = b;
+        const float* end = pa + dimension;
+
         __m256 sum = _mm256_setzero_ps();
-        
-        while (a + 8 <= end) {
-            __m256 va = _mm256_loadu_ps(a);
-            __m256 vb = _mm256_loadu_ps(b);
-            __m256 diff = _mm256_sub_ps(va, vb);
-            sum = _mm256_fmadd_ps(diff, diff, sum);
-            a += 8;
-            b += 8;
-        }
-        
-        alignas(32) float temp[8];
-        _mm256_store_ps(temp, sum);
-        for (int i = 0; i < 8; ++i) result += temp[i];
-        
-        while (a < end) {
-            float d = *a - *b;
-            result += d * d;
-            ++a;
-            ++b;
-        }
-        
+
         if (metric == Metric::IP) {
+            while (pa + 8 <= end) {
+                sum = _mm256_fmadd_ps(_mm256_loadu_ps(pa), _mm256_loadu_ps(pb), sum);
+                pa += 8; pb += 8;
+            }
+            alignas(32) float temp[8];
+            _mm256_store_ps(temp, sum);
+            for (int i = 0; i < 8; ++i) result += temp[i];
+            while (pa < end) { result += (*pa++) * (*pb++); }
             return -result;
+        } else {
+            while (pa + 8 <= end) {
+                __m256 diff = _mm256_sub_ps(_mm256_loadu_ps(pa), _mm256_loadu_ps(pb));
+                sum = _mm256_fmadd_ps(diff, diff, sum);
+                pa += 8; pb += 8;
+            }
+            alignas(32) float temp[8];
+            _mm256_store_ps(temp, sum);
+            for (int i = 0; i < 8; ++i) result += temp[i];
+            while (pa < end) { float d = (*pa++) - (*pb++); result += d * d; }
+            return result;
         }
-        return result;
 #else
         if (metric == Metric::IP) {
             return -distance::inner_product({a, dimension}, {b, dimension});
@@ -136,6 +141,113 @@ struct IndexHNSW::Impl {
 
     const float* get_vector(uint32_t node_id) const {
         return data.data() + static_cast<size_t>(node_id) * dimension;
+    }
+
+    // BF16 = top 16 bits of float32 (same exponent, 7 mantissa bits instead of 23).
+    static uint16_t float_to_bf16(float f) {
+        uint32_t bits;
+        std::memcpy(&bits, &f, sizeof(bits));
+        return static_cast<uint16_t>(bits >> 16);
+    }
+
+    // L2 or IP distance between a float32 query and a BF16-stored database vector.
+    // With -march=native and __AVX512BF16__ the inner loop reads 32 bytes (16 BF16)
+    // per iteration instead of 64 bytes (16 fp32), halving cache/bandwidth pressure.
+    float distance_bf16(const float* query, uint32_t node_id) const {
+        const uint16_t* d = data_bf16.data() + static_cast<size_t>(node_id) * dimension;
+#if defined(__AVX512BF16__)
+        const size_t simd_len = dimension & ~15u;
+        __m512 sum = _mm512_setzero_ps();
+        for (size_t i = 0; i < simd_len; i += 16) {
+            __m512 q_vec = _mm512_loadu_ps(query + i);
+            __m256i raw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(d + i));
+            __m512 d_vec = _mm512_cvtpbh_ps(reinterpret_cast<__m256bh>(raw));
+            if (metric == Metric::IP) {
+                sum = _mm512_fmadd_ps(q_vec, d_vec, sum);
+            } else {
+                __m512 diff = _mm512_sub_ps(q_vec, d_vec);
+                sum = _mm512_fmadd_ps(diff, diff, sum);
+            }
+        }
+        float result = _mm512_reduce_add_ps(sum);
+        for (size_t i = simd_len; i < dimension; ++i) {
+            uint32_t bits = static_cast<uint32_t>(d[i]) << 16;
+            float dv;
+            std::memcpy(&dv, &bits, sizeof(dv));
+            if (metric == Metric::IP) {
+                result += query[i] * dv;
+            } else {
+                float diff = query[i] - dv;
+                result += diff * diff;
+            }
+        }
+        return (metric == Metric::IP) ? -result : result;
+#else
+        float result = 0.0f;
+        for (size_t i = 0; i < dimension; ++i) {
+            uint32_t bits = static_cast<uint32_t>(d[i]) << 16;
+            float dv;
+            std::memcpy(&dv, &bits, sizeof(dv));
+            if (metric == Metric::IP) {
+                result += query[i] * dv;
+            } else {
+                float diff = query[i] - dv;
+                result += diff * diff;
+            }
+        }
+        return (metric == Metric::IP) ? -result : result;
+#endif
+    }
+
+    // Quantize float32 → int8 using this index's scale.  Called once per search_layer()
+    // call for the query, and once per inserted vector.
+    static void quantize_f32_to_i8(const float* __restrict__ src,
+                                    int8_t*      __restrict__ dst,
+                                    uint32_t n, float scale) {
+        for (uint32_t i = 0; i < n; ++i) {
+            int q = static_cast<int>(std::lroundf(src[i] * scale));
+            dst[i] = static_cast<int8_t>(q < -127 ? -127 : q > 127 ? 127 : q);
+        }
+    }
+
+    // L2 or IP distance between a pre-quantized int8 query and an int8 database vector.
+    // Accumulates in int32 — safe for dimension ≤ 292: max L2 = 292 × 254² ≈ 18.8M < INT32_MAX.
+    float distance_int8_preq(const int8_t* __restrict__ q_i8, uint32_t node_id) const {
+        const int8_t* db = data_int8.data() + static_cast<size_t>(node_id) * dimension;
+        int32_t result = 0;
+#if defined(__AVX2__)
+        __m256i sum32 = _mm256_setzero_si256();
+        uint32_t i = 0;
+        for (; i + 16u <= dimension; i += 16u) {
+            __m128i q8  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(q_i8 + i));
+            __m128i d8  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(db + i));
+            __m256i q16 = _mm256_cvtepi8_epi16(q8);
+            __m256i d16 = _mm256_cvtepi8_epi16(d8);
+            if (metric == Metric::L2) {
+                __m256i diff = _mm256_sub_epi16(q16, d16);
+                sum32 = _mm256_add_epi32(sum32, _mm256_madd_epi16(diff, diff));
+            } else {
+                sum32 = _mm256_add_epi32(sum32, _mm256_madd_epi16(q16, d16));
+            }
+        }
+        __m128i lo  = _mm256_castsi256_si128(sum32);
+        __m128i hi  = _mm256_extracti128_si256(sum32, 1);
+        __m128i s   = _mm_add_epi32(lo, hi);
+        s = _mm_hadd_epi32(s, s);
+        s = _mm_hadd_epi32(s, s);
+        result = _mm_cvtsi128_si32(s);
+        for (; i < dimension; ++i) {
+            int32_t qi = q_i8[i], di = db[i];
+            result += (metric == Metric::L2) ? (qi - di) * (qi - di) : qi * di;
+        }
+#else
+        for (uint32_t i = 0; i < dimension; ++i) {
+            int32_t qi = q_i8[i], di = db[i];
+            result += (metric == Metric::L2) ? (qi - di) * (qi - di) : qi * di;
+        }
+#endif
+        const float inv_scale2 = 1.0f / (int8_scale * int8_scale);
+        return static_cast<float>((metric == Metric::IP) ? -result : result) * inv_scale2;
     }
 
     uint32_t random_level() {
@@ -162,8 +274,21 @@ struct IndexHNSW::Impl {
         MaxHeap results;     // max-heap: largest dist on top
         std::vector<uint32_t> neighbors_snapshot;
 
+        const bool int8_mode = params.use_int8_storage && !data_int8.empty();
+        const bool bf16_mode = params.use_bf16_storage && !data_bf16.empty() && !int8_mode;
+        std::vector<int8_t> query_i8;
+        if (int8_mode) {
+            query_i8.resize(dimension);
+            quantize_f32_to_i8(query, query_i8.data(), dimension, int8_scale);
+        }
+        auto node_dist = [&](uint32_t node_id) -> float {
+            if (int8_mode)  return distance_int8_preq(query_i8.data(), node_id);
+            if (bf16_mode)  return distance_bf16(query, node_id);
+            return distance(query, get_vector(node_id));
+        };
+
         for (uint32_t ep : entry_points) {
-            float dist = distance(query, get_vector(ep));
+            float dist = node_dist(ep);
             visited.insert(ep);
             candidates.emplace(dist, ep);
             results.emplace(dist, ep);
@@ -184,7 +309,7 @@ struct IndexHNSW::Impl {
                     if (visited.count(neighbor)) continue;
                     visited.insert(neighbor);
 
-                    float n_dist = distance(query, get_vector(neighbor));
+                    float n_dist = node_dist(neighbor);
                     float f_dist_now = results.empty() ? INFINITY : results.top().first;
 
                     if (n_dist < f_dist_now || results.size() < ef) {
@@ -215,7 +340,7 @@ struct IndexHNSW::Impl {
                 if (visited.count(neighbor)) continue;
                 visited.insert(neighbor);
 
-                float n_dist = distance(query, get_vector(neighbor));
+                float n_dist = node_dist(neighbor);
                 float f_dist_now = results.empty() ? INFINITY : results.top().first;
 
                 if (n_dist < f_dist_now || results.size() < ef) {
@@ -343,6 +468,16 @@ struct IndexHNSW::Impl {
         }
 
         data.insert(data.end(), vec, vec + dimension);
+        if (params.use_bf16_storage) {
+            for (uint32_t i = 0; i < dimension; ++i) {
+                data_bf16.push_back(float_to_bf16(vec[i]));
+            }
+        }
+        if (params.use_int8_storage) {
+            data_int8.resize(data_int8.size() + dimension);
+            int8_t* dst = data_int8.data() + data_int8.size() - dimension;
+            quantize_f32_to_i8(vec, dst, dimension, int8_scale);
+        }
         id_mapping.push_back(external_id);
         id_set.insert(external_id);
 
@@ -440,6 +575,7 @@ Expected<IndexHNSW> IndexHNSW::create(uint32_t dimension,
         index.impl_->params.ml_factor = 1.0f / std::log(static_cast<float>(params.M));
     }
 
+    index.impl_->int8_scale = params.int8_scale;
     index.impl_->data.reserve(1024 * dimension);
     index.impl_->nodes.reserve(1024);
     index.impl_->id_mapping.reserve(1024);
@@ -550,6 +686,21 @@ Expected<void> IndexHNSW::add(std::span<const float> data, uint64_t n,
                     data.data(),
                     static_cast<size_t>(n) * dim * sizeof(float));
 
+        if (impl_->params.use_int8_storage) {
+            const size_t old_i8_size = impl_->data_int8.size();
+            impl_->data_int8.resize(old_i8_size + static_cast<size_t>(n) * dim);
+            Impl::quantize_f32_to_i8(data.data(),
+                                     impl_->data_int8.data() + old_i8_size,
+                                     static_cast<uint32_t>(n * dim),
+                                     impl_->int8_scale);
+        } else if (impl_->params.use_bf16_storage) {
+            const size_t old_bf16_size = impl_->data_bf16.size();
+            impl_->data_bf16.resize(old_bf16_size + static_cast<size_t>(n) * dim);
+            for (size_t j = 0; j < n * dim; ++j) {
+                impl_->data_bf16[old_bf16_size + j] = Impl::float_to_bf16(data[j]);
+            }
+        }
+
         const size_t old_id_size = impl_->id_mapping.size();
         impl_->id_mapping.resize(old_id_size + static_cast<size_t>(n));
         for (uint64_t i = 0; i < n; ++i) {
@@ -591,6 +742,16 @@ Expected<void> IndexHNSW::add(std::span<const float> data, uint64_t n,
             const float* vec = data.data() + i * impl_->dimension;
 
             impl_->data.insert(impl_->data.end(), vec, vec + impl_->dimension);
+            if (impl_->params.use_int8_storage) {
+                const size_t old_sz = impl_->data_int8.size();
+                impl_->data_int8.resize(old_sz + impl_->dimension);
+                Impl::quantize_f32_to_i8(vec, impl_->data_int8.data() + old_sz,
+                                         impl_->dimension, impl_->int8_scale);
+            } else if (impl_->params.use_bf16_storage) {
+                for (uint32_t d = 0; d < impl_->dimension; ++d) {
+                    impl_->data_bf16.push_back(Impl::float_to_bf16(vec[d]));
+                }
+            }
             impl_->id_mapping.push_back(id);
             impl_->id_set.insert(id);
 
@@ -989,69 +1150,173 @@ void IndexHNSW::search_single_locked(const float* query, uint32_t k, SearchResul
     }
 }
 
+static uint16_t f32_to_f16(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, sizeof(x));
+    uint16_t h = static_cast<uint16_t>((x >> 16) & 0x8000u);
+    int exp = static_cast<int>((x >> 23) & 0xffu) - 127 + 15;
+    if (exp <= 0)  return h;
+    if (exp >= 31) { h |= 0x7c00u; return h; }
+    h |= static_cast<uint16_t>((static_cast<uint32_t>(exp) << 10) | ((x >> 13) & 0x3ffu));
+    return h;
+}
+
 Expected<SearchResults> IndexHNSW::search_batch_gpu(std::span<const float> queries,
                                                     uint64_t n_queries, uint32_t k) {
     if (!impl_->ctx || !impl_->gpu_initialized) {
         return make_unexpected(ErrorCode::OperationFailed, "GPU not initialized");
     }
-    
-    SearchResults results(n_queries, k);
-    
-    uint64_t data_size = impl_->n_vectors * impl_->dimension * sizeof(float);
-    if (!impl_->gpu_data_buffer.valid() || impl_->gpu_data_buffer.size() < data_size) {
+
+    const uint32_t dim    = impl_->dimension;
+    const uint64_t n_vecs = impl_->n_vectors;
+
+    // 1. Upload database vectors as fp16 (once; re-upload only if buffer is stale/missing)
+    uint64_t data_fp16_size = n_vecs * dim * sizeof(uint16_t);
+    if (!impl_->gpu_data_buffer.valid() || impl_->gpu_data_buffer.size() < data_fp16_size) {
         BufferDesc data_desc = {};
-        data_desc.size = data_size;
-        data_desc.usage = BufferUsage::Storage | BufferUsage::TransferDst;
-        data_desc.memory_type = MemoryType::DeviceLocal;
-        
+        data_desc.size         = data_fp16_size;
+        data_desc.usage        = BufferUsage::Storage | BufferUsage::TransferDst;
+        // Unified: zero-copy on APU DEVICE_LOCAL|HOST_VISIBLE; PCIe-mapped on dGPU.
+        data_desc.memory_type  = MemoryType::Unified;
+
         auto buf = Buffer::create(*impl_->ctx, data_desc);
         if (!buf) {
             return make_unexpected(buf.error().code(), "Failed to create GPU data buffer");
         }
         impl_->gpu_data_buffer = std::move(*buf);
-        
-        std::vector<uint8_t> bytes(impl_->data.size() * sizeof(float));
-        std::memcpy(bytes.data(), impl_->data.data(), bytes.size());
-        auto upload_result = impl_->gpu_data_buffer.upload(bytes);
-        if (!upload_result) {
-            return make_unexpected(upload_result.error().code(), "Failed to upload data to GPU");
+
+        std::vector<uint16_t> fp16_data(n_vecs * dim);
+        const float* src = impl_->data.data();
+        for (uint64_t i = 0; i < n_vecs * dim; ++i) {
+            fp16_data[i] = f32_to_f16(src[i]);
+        }
+        std::vector<uint8_t> bytes(fp16_data.size() * sizeof(uint16_t));
+        std::memcpy(bytes.data(), fp16_data.data(), bytes.size());
+        auto r = impl_->gpu_data_buffer.upload(bytes);
+        if (!r) {
+            return make_unexpected(r.error().code(), "Failed to upload data to GPU");
         }
     }
-    
-    uint32_t num_threads = std::min(std::thread::hardware_concurrency(), 
-                                    static_cast<unsigned int>(n_queries));
-    if (num_threads == 0) num_threads = 1;
-    
-    std::shared_lock lock(impl_->mutex);
-    std::atomic<uint64_t> next_query{0};
-    
-    auto worker = [&]() {
-        while (true) {
-            uint64_t q = next_query.fetch_add(1);
-            if (q >= n_queries) break;
-            
-            search_single_locked(queries.data() + q * impl_->dimension, k, 
-                                 results.results.data() + q * k);
+
+    // 2. Upload all queries as fp16 (one buffer, one transfer)
+    {
+        BufferDesc q_desc = {};
+        q_desc.size        = n_queries * dim * sizeof(uint16_t);
+        q_desc.usage       = BufferUsage::Storage | BufferUsage::TransferDst;
+        q_desc.memory_type = MemoryType::Unified;
+
+        auto buf = Buffer::create(*impl_->ctx, q_desc);
+        if (!buf) {
+            return make_unexpected(buf.error().code(), "Failed to create GPU query buffer");
         }
+        impl_->gpu_query_buffer = std::move(*buf);
+
+        std::vector<uint16_t> fp16_q(n_queries * dim);
+        for (uint64_t i = 0; i < n_queries * dim; ++i) {
+            fp16_q[i] = f32_to_f16(queries[i]);
+        }
+        std::vector<uint8_t> bytes(fp16_q.size() * sizeof(uint16_t));
+        std::memcpy(bytes.data(), fp16_q.data(), bytes.size());
+        auto r = impl_->gpu_query_buffer.upload(bytes);
+        if (!r) {
+            return make_unexpected(r.error().code(), "Failed to upload queries to GPU");
+        }
+    }
+
+    // 3. Distance readback buffer (GPU writes, CPU reads)
+    uint64_t dist_size = n_vecs * sizeof(float);
+    {
+        BufferDesc d_desc = {};
+        d_desc.size        = dist_size;
+        d_desc.usage       = BufferUsage::Storage;
+        d_desc.memory_type = MemoryType::HostReadback;
+
+        auto buf = Buffer::create(*impl_->ctx, d_desc);
+        if (!buf) {
+            return make_unexpected(buf.error().code(), "Failed to create GPU distance buffer");
+        }
+        impl_->gpu_distance_buffer = std::move(*buf);
+    }
+
+    // 4. Bind all three buffers to the descriptor set
+    {
+        auto r0 = impl_->gpu_distance_desc_set.bind_buffer(0, impl_->gpu_data_buffer);
+        auto r1 = impl_->gpu_distance_desc_set.bind_buffer(1, impl_->gpu_query_buffer);
+        auto r2 = impl_->gpu_distance_desc_set.bind_buffer(2, impl_->gpu_distance_buffer);
+        if (!r0 || !r1 || !r2) {
+            return make_unexpected(ErrorCode::OperationFailed,
+                                   "Failed to bind descriptor set buffers");
+        }
+    }
+
+    // 5. Allocate one command buffer; reset+re-record per query
+    auto cmd_result = CommandBuffer::create(*impl_->ctx);
+    if (!cmd_result) {
+        return make_unexpected(cmd_result.error().code(), "Failed to create command buffer");
+    }
+    auto cmd = std::move(*cmd_result);
+
+    SearchResults results(n_queries, k);
+    std::vector<float>    distances(n_vecs);
+    std::vector<uint32_t> indices(n_vecs);
+    std::iota(indices.begin(), indices.end(), 0u);
+
+    const uint32_t workgroup_size = 256;
+    const uint32_t dispatch_x    = static_cast<uint32_t>((n_vecs + workgroup_size - 1) / workgroup_size);
+
+    struct PushConstants {
+        uint32_t n_vectors;
+        uint32_t dimension;
+        uint32_t query_offset;  // index into fp16 query buffer (= q * dim)
+        uint32_t pad;
     };
-    
-    if (num_threads > 1) {
-        std::vector<std::thread> threads;
-        threads.reserve(num_threads - 1);
-        for (uint32_t t = 0; t < num_threads - 1; ++t) {
-            threads.emplace_back(worker);
+
+    std::shared_lock lock(impl_->mutex);
+
+    // 6. Per-query GPU dispatch
+    for (uint64_t q = 0; q < n_queries; ++q) {
+        PushConstants pc = {
+            static_cast<uint32_t>(n_vecs),
+            dim,
+            static_cast<uint32_t>(q * dim),
+            0u
+        };
+
+        cmd.reset();
+        cmd.begin();
+        cmd.bind_pipeline(impl_->gpu_distance_pipeline);
+        cmd.bind_descriptor_set(impl_->gpu_distance_pipeline, impl_->gpu_distance_desc_set);
+        cmd.push_constants(impl_->gpu_distance_pipeline, &pc, sizeof(pc));
+        cmd.dispatch(dispatch_x, 1, 1);
+        cmd.barrier();
+        cmd.end();
+
+        auto submit_r = submit_and_wait(*impl_->ctx, cmd);
+        if (!submit_r) {
+            return make_unexpected(submit_r.error().code(), "GPU dispatch failed");
         }
-        worker();
-        for (auto& t : threads) {
-            t.join();
+
+        // Read distances back to host
+        std::vector<uint8_t> raw(dist_size);
+        auto dl = impl_->gpu_distance_buffer.download(raw);
+        if (!dl) {
+            return make_unexpected(dl.error().code(), "Failed to download distances from GPU");
         }
-    } else {
-        for (uint64_t q = 0; q < n_queries; ++q) {
-            search_single_locked(queries.data() + q * impl_->dimension, k, 
-                                 results.results.data() + q * k);
+        std::memcpy(distances.data(), raw.data(), dist_size);
+
+        // Pick top-k: O(n log k)
+        std::iota(indices.begin(), indices.end(), 0u);
+        uint32_t actual_k = std::min(k, static_cast<uint32_t>(n_vecs));
+        std::partial_sort(indices.begin(), indices.begin() + actual_k, indices.end(),
+            [&](uint32_t a, uint32_t b) { return distances[a] < distances[b]; });
+
+        SearchResult* out = results.results.data() + q * k;
+        for (uint32_t i = 0; i < actual_k; ++i) {
+            out[i].distance = distances[indices[i]];
+            out[i].id       = impl_->id_mapping[indices[i]];
         }
     }
-    
+
     return results;
 }
 
@@ -1177,6 +1442,23 @@ Expected<void> IndexHNSW::load(const std::filesystem::path& path) {
         return make_unexpected(ErrorCode::ReadFailed, "Failed to read index data");
     }
 
+    // Rebuild BF16 cache if this index was configured for BF16 CPU storage.
+    if (impl_->params.use_bf16_storage) {
+        impl_->data_bf16.clear();
+        impl_->data_bf16.reserve(impl_->data.size());
+        for (float f : impl_->data) {
+            impl_->data_bf16.push_back(Impl::float_to_bf16(f));
+        }
+    }
+
+    // Rebuild int8 cache if configured for int8 CPU storage.
+    if (impl_->params.use_int8_storage) {
+        impl_->data_int8.resize(impl_->data.size());
+        Impl::quantize_f32_to_i8(impl_->data.data(), impl_->data_int8.data(),
+                                  static_cast<uint32_t>(impl_->data.size()),
+                                  impl_->int8_scale);
+    }
+
     return {};
 }
 
@@ -1185,6 +1467,8 @@ void IndexHNSW::reset() {
         std::unique_lock lock(impl_->mutex);
         impl_->n_vectors = 0;
         impl_->data.clear();
+        impl_->data_bf16.clear();
+        impl_->data_int8.clear();
         impl_->nodes.clear();
         impl_->id_mapping.clear();
         impl_->id_set.clear();

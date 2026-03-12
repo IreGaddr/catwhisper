@@ -39,7 +39,9 @@ enum class MemoryType {
     HostVisible,
     HostCoherent,
     DeviceOnly,
-    HostReadback   // GPU writes, CPU reads — VMA_MEMORY_USAGE_GPU_TO_CPU (host-cached)
+    HostReadback,  // GPU writes, CPU reads — VMA_MEMORY_USAGE_GPU_TO_CPU (host-cached)
+    Unified        // VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE + host-write access; on APU this
+                   // lands in the DEVICE_LOCAL|HOST_VISIBLE heap for zero-copy CPU↔GPU access
 };
 
 struct BufferDesc {
