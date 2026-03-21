@@ -38,8 +38,7 @@ float l2_sqr(std::span<const float> a, std::span<const float> b) {
         __m512 a_vec = _mm512_loadu_ps(a.data() + i);
         __m512 b_vec = _mm512_loadu_ps(b.data() + i);
         __m512 diff = _mm512_sub_ps(a_vec, b_vec);
-        __m512 sq = _mm512_mul_ps(diff, diff);
-        sum_vec = _mm512_add_ps(sum_vec, sq);
+        sum_vec = _mm512_fmadd_ps(diff, diff, sum_vec);
     }
     
     float sum = avx512_reduce_add_ps(sum_vec);
@@ -62,18 +61,16 @@ float l2_sqr(std::span<const float> a, std::span<const float> b) {
 
 float inner_product(std::span<const float> a, std::span<const float> b) {
     const size_t n = std::min(a.size(), b.size());
-    
+
 #if defined(__AVX512F__)
-    // AVX512 implementation with FMA: process 16 floats per iteration
+    // AVX512 FMA: sum += a * b in single fused multiply-add
     const size_t simd_len = n & ~15u;
     __m512 sum_vec = _mm512_setzero_ps();
-    
+
     for (size_t i = 0; i < simd_len; i += 16) {
         __m512 a_vec = _mm512_loadu_ps(a.data() + i);
         __m512 b_vec = _mm512_loadu_ps(b.data() + i);
-        // Fused multiply-add: sum += a * b in single instruction
-        __m512 prod = _mm512_mul_ps(a_vec, b_vec);
-        sum_vec = _mm512_add_ps(sum_vec, prod);
+        sum_vec = _mm512_fmadd_ps(a_vec, b_vec, sum_vec);
     }
     
     float sum = avx512_reduce_add_ps(sum_vec);
@@ -98,6 +95,32 @@ float cosine_similarity(std::span<const float> a, std::span<const float> b) {
         return 0.0f;
     }
 
+#if defined(__AVX512F__)
+    // Triple-accumulator: dot, norm_a, norm_b in one pass over the data
+    const size_t simd_len = n & ~15u;
+    __m512 dot_vec    = _mm512_setzero_ps();
+    __m512 norm_a_vec = _mm512_setzero_ps();
+    __m512 norm_b_vec = _mm512_setzero_ps();
+
+    for (size_t i = 0; i < simd_len; i += 16) {
+        __m512 a_vec = _mm512_loadu_ps(a.data() + i);
+        __m512 b_vec = _mm512_loadu_ps(b.data() + i);
+        dot_vec    = _mm512_fmadd_ps(a_vec, b_vec, dot_vec);
+        norm_a_vec = _mm512_fmadd_ps(a_vec, a_vec, norm_a_vec);
+        norm_b_vec = _mm512_fmadd_ps(b_vec, b_vec, norm_b_vec);
+    }
+
+    float dot       = avx512_reduce_add_ps(dot_vec);
+    float norm_a_sq = avx512_reduce_add_ps(norm_a_vec);
+    float norm_b_sq = avx512_reduce_add_ps(norm_b_vec);
+
+    // Scalar tail
+    for (size_t i = simd_len; i < n; ++i) {
+        dot       += a[i] * b[i];
+        norm_a_sq += a[i] * a[i];
+        norm_b_sq += b[i] * b[i];
+    }
+#else
     float dot = 0.0f;
     float norm_a_sq = 0.0f;
     float norm_b_sq = 0.0f;
@@ -106,6 +129,7 @@ float cosine_similarity(std::span<const float> a, std::span<const float> b) {
         norm_a_sq += a[i] * a[i];
         norm_b_sq += b[i] * b[i];
     }
+#endif
 
     if (norm_a_sq <= 0.0f || norm_b_sq <= 0.0f) {
         return 0.0f;
@@ -177,8 +201,10 @@ std::vector<float> normalized(std::span<const float> vec) {
 } // namespace distance
 
 void normalize_batch(std::span<float> data, uint64_t n, uint32_t dim) {
+    float* base = data.data();
+    #pragma omp parallel for schedule(static) if(n > 64)
     for (uint64_t i = 0; i < n; ++i) {
-        distance::normalize(data.subspan(i * dim, dim));
+        distance::normalize(std::span<float>(base + i * dim, dim));
     }
 }
 

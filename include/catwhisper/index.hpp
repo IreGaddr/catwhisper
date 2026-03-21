@@ -39,9 +39,40 @@ public:
     virtual Expected<void> add(std::span<const float> data, uint64_t n,
                                std::span<const VectorId> ids = {}) = 0;
 
+    virtual Expected<void> add_int16(std::span<const int16_t> data, uint64_t n,
+                                     std::span<const VectorId> ids = {}) {
+        // Default: convert int16 → float and delegate.
+        const uint32_t dim = dimension();
+        std::vector<float> f32(data.size());
+        for (size_t i = 0; i < data.size(); ++i) {
+            f32[i] = static_cast<float>(data[i]);
+        }
+        return add(f32, n, ids);
+    }
+
     virtual Expected<SearchResults> search(Vector query, uint32_t k) = 0;
     virtual Expected<SearchResults> search(std::span<const float> queries,
                                            uint64_t n_queries, uint32_t k) = 0;
+
+    virtual Expected<SearchResults> search_int16(VectorI16 query, uint32_t k) {
+        // Default: convert int16 → float and delegate.
+        const uint32_t dim = dimension();
+        std::vector<float> f32(query.size());
+        for (size_t i = 0; i < query.size(); ++i) {
+            f32[i] = static_cast<float>(query[i]);
+        }
+        return search({f32.data(), dim}, k);
+    }
+
+    virtual Expected<SearchResults> search_int16(std::span<const int16_t> queries,
+                                                  uint64_t n_queries, uint32_t k) {
+        // Default: convert int16 → float and delegate.
+        std::vector<float> f32(queries.size());
+        for (size_t i = 0; i < queries.size(); ++i) {
+            f32[i] = static_cast<float>(queries[i]);
+        }
+        return search(f32, n_queries, k);
+    }
 
     virtual Expected<void> save(const std::filesystem::path& path) const = 0;
     virtual Expected<void> load(const std::filesystem::path& path) = 0;

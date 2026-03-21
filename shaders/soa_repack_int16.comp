@@ -1,0 +1,32 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+
+// SoA repack for int16 database.
+// Copies n_vectors from old SoA (stride old_capacity) into new SoA (stride new_capacity).
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer OldBuffer {
+    int16_t old_soa[];
+};
+
+layout(set = 0, binding = 1) buffer NewBuffer {
+    int16_t new_soa[];
+};
+
+layout(push_constant) uniform PC {
+    uint n_vectors;
+    uint dim;
+    uint old_capacity;
+    uint new_capacity;
+};
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= n_vectors * dim) return;
+
+    uint v = gid % n_vectors;
+    uint d = gid / n_vectors;
+
+    new_soa[d * new_capacity + v] = old_soa[d * old_capacity + v];
+}

@@ -665,17 +665,19 @@ Expected<void> IndexFlat::add(std::span<const float> data, uint64_t n,
     cmd.bind_pipeline(ta_pl);
     cmd.bind_descriptor_set(ta_pl, ta_ds);
     cmd.push_constants(ta_pl, &tpc, sizeof(tpc));
-    
+
     uint64_t total_elements = n * impl_->dimension;
     uint32_t n_wg = static_cast<uint32_t>((total_elements + 255) / 256);
     cmd.dispatch(n_wg);
     cmd.end();
-    
-    auto submit_result = submit_and_wait(*impl_->ctx, cmd);
-    if (!submit_result) {
-        return submit_result;
+
+    // Submit GPU transpose asynchronously — CPU can update id_mapping while GPU works.
+    auto ticket = submit_async(*impl_->ctx, cmd);
+    if (!ticket) {
+        return make_unexpected(ticket.error().code(), ticket.error().message());
     }
-    
+
+    // CPU work: update id_mapping while GPU transposes (overlapped)
     if (ids.empty()) {
         for (uint64_t i = 0; i < n; ++i) {
             impl_->id_mapping.push_back(impl_->n_vectors + i);
@@ -685,7 +687,14 @@ Expected<void> IndexFlat::add(std::span<const float> data, uint64_t n,
             impl_->id_mapping.push_back(ids[i]);
         }
     }
-    
+
+    // Wait for GPU transpose to complete before updating n_vectors
+    // (search uses n_vectors to bound the dispatch)
+    auto wait_result = wait_timeline(*impl_->ctx, *ticket);
+    if (!wait_result) {
+        return make_unexpected(wait_result.error().code(), wait_result.error().message());
+    }
+
     impl_->n_vectors = new_size;
     return {};
 }

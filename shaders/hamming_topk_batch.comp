@@ -1,0 +1,126 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+// Batch Hamming distance + top-k for IOT fractal path signatures.
+//
+// Each stored vector has a packed bit signature (n_words × uint64).
+// For a batch of queries, compute Hamming distance to all stored sigs,
+// then select top-k smallest per query.
+//
+// 2D dispatch: X = signature chunk index, Y = query index.
+// Database layout: sigs[vector_idx * n_words + word_idx]  (row-major)
+// Query layout:    queries[query_idx * n_words + word_idx] (row-major)
+//
+// Popcount via bitCount() on uvec2 halves of each uint64.
+
+layout(local_size_x = 256) in;
+
+// Signatures stored as uvec2 (emulating uint64: .x = low32, .y = high32)
+layout(set = 0, binding = 0) readonly buffer DatabaseSigs {
+    uvec2 database_sigs[];
+};
+
+layout(set = 0, binding = 1) readonly buffer QuerySigs {
+    uvec2 query_sigs[];
+};
+
+layout(set = 0, binding = 2) buffer OutputDistances {
+    float out_distances[];
+};
+
+layout(set = 0, binding = 3) buffer OutputIndices {
+    uint out_indices[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint n_vectors;     // Number of stored signatures
+    uint n_words;       // 64-bit words per signature (stored as uvec2)
+    uint k;             // Top-k to select
+    uint n_queries;     // Number of queries in batch
+    uint capacity;      // Row stride for output (>= n_vectors, for alignment)
+};
+
+struct Pair {
+    float dist;
+    uint  idx;
+};
+
+const uint CHUNK = 512u;
+shared Pair sort_buf[CHUNK];
+
+// Popcount of a uvec2 (emulated uint64)
+uint popcnt64(uvec2 v) {
+    return bitCount(v.x) + bitCount(v.y);
+}
+
+uint compute_hamming(uint vec_idx, uint query_offset) {
+    uint dist = 0u;
+    uint db_base = vec_idx * n_words;
+    uint q_base = query_offset;
+
+    for (uint w = 0u; w < n_words; ++w) {
+        uvec2 db_word = database_sigs[db_base + w];
+        uvec2 q_word  = query_sigs[q_base + w];
+        uvec2 xored   = uvec2(db_word.x ^ q_word.x, db_word.y ^ q_word.y);
+        dist += popcnt64(xored);
+    }
+    return dist;
+}
+
+// Bitonic sort network on sort_buf[0..CHUNK-1]
+void bitonic_sort() {
+    for (uint size = 2u; size <= CHUNK; size <<= 1u) {
+        for (uint stride = size >> 1u; stride > 0u; stride >>= 1u) {
+            barrier();
+            uint tid = gl_LocalInvocationID.x;
+            // Each thread handles two elements
+            for (uint i = tid; i < CHUNK / 2u; i += gl_WorkGroupSize.x) {
+                uint pos = 2u * stride * (i / stride) + (i % stride);
+                uint partner = pos + stride;
+                if (partner < CHUNK) {
+                    bool ascending = ((pos / size) % 2u) == 0u;
+                    bool should_swap = ascending
+                        ? (sort_buf[pos].dist > sort_buf[partner].dist)
+                        : (sort_buf[pos].dist < sort_buf[partner].dist);
+                    if (should_swap) {
+                        Pair tmp = sort_buf[pos];
+                        sort_buf[pos] = sort_buf[partner];
+                        sort_buf[partner] = tmp;
+                    }
+                }
+            }
+        }
+    }
+    barrier();
+}
+
+void main() {
+    uint chunk_idx  = gl_WorkGroupID.x;
+    uint query_idx  = gl_WorkGroupID.y;
+    uint tid        = gl_LocalInvocationID.x;
+    uint chunk_base = chunk_idx * CHUNK;
+    uint q_offset   = query_idx * n_words;
+
+    // Each thread computes Hamming distance for 2 vectors (CHUNK / local_size_x = 2)
+    for (uint i = tid; i < CHUNK; i += gl_WorkGroupSize.x) {
+        uint vec_idx = chunk_base + i;
+        if (vec_idx < n_vectors) {
+            sort_buf[i].dist = float(compute_hamming(vec_idx, q_offset));
+            sort_buf[i].idx  = vec_idx;
+        } else {
+            sort_buf[i].dist = 1e30;  // Sentinel
+            sort_buf[i].idx  = 0xFFFFFFFFu;
+        }
+    }
+    barrier();
+
+    bitonic_sort();
+
+    // Write top-k results for this chunk
+    uint out_base = (query_idx * ((n_vectors + CHUNK - 1u) / CHUNK) + chunk_idx) * k;
+    for (uint i = tid; i < k && i < CHUNK; i += gl_WorkGroupSize.x) {
+        out_distances[out_base + i] = sort_buf[i].dist;
+        out_indices[out_base + i]   = sort_buf[i].idx;
+    }
+}

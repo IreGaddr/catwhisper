@@ -20,6 +20,10 @@ struct HNSWParams {
                                           // use_int8_storage takes precedence over use_bf16_storage.
     float int8_scale = 127.0f;            // Quantization scale: quantized = clamp(round(v * int8_scale), -127, 127).
                                           // Default 127 assumes values in [-1, 1].
+    bool use_int16_storage = false;       // Store vectors natively as int16 — zero conversion.
+                                          // Takes precedence over use_int8_storage and use_bf16_storage.
+                                          // Distance computed via SIMD int16 dot product with
+                                          // precomputed int64 norms for L2/Cosine.
 };
 
 struct HNSWGPUOptions {
@@ -56,10 +60,15 @@ public:
 
     Expected<void> add(std::span<const float> data, uint64_t n,
                        std::span<const VectorId> ids = {}) override;
+    Expected<void> add_int16(std::span<const int16_t> data, uint64_t n,
+                             std::span<const VectorId> ids = {}) override;
 
     Expected<SearchResults> search(Vector query, uint32_t k) override;
     Expected<SearchResults> search(std::span<const float> queries,
                                    uint64_t n_queries, uint32_t k) override;
+    Expected<SearchResults> search_int16(VectorI16 query, uint32_t k) override;
+    Expected<SearchResults> search_int16(std::span<const int16_t> queries,
+                                         uint64_t n_queries, uint32_t k) override;
 
     Expected<void> save(const std::filesystem::path& path) const override;
     Expected<void> load(const std::filesystem::path& path) override;
@@ -71,6 +80,7 @@ public:
 
     bool valid() const { return impl_ != nullptr; }
     bool gpu_enabled() const;
+    bool gpu_int16_enabled() const;
 
 private:
     struct Impl;
@@ -80,8 +90,12 @@ private:
     Expected<void> add_single(const float* vec, VectorId id);
     void connect_node(uint32_t node_id, uint32_t level);
     void search_single_locked(const float* query, uint32_t k, SearchResult* out);
+    void search_single_locked_int16(const int16_t* query, int64_t query_norm_sq,
+                                     uint32_t k, SearchResult* out);
     Expected<SearchResults> search_batch_gpu(std::span<const float> queries,
                                              uint64_t n_queries, uint32_t k);
+    Expected<SearchResults> search_batch_gpu_int16(std::span<const int16_t> queries,
+                                                    uint64_t n_queries, uint32_t k);
 };
 
 } // namespace cw

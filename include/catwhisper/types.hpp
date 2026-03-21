@@ -9,13 +9,15 @@
 namespace cw {
 
 using Vector = std::span<const float>;
+using VectorI16 = std::span<const int16_t>;
 using VectorMut = std::span<float>;
 using VectorId = uint64_t;
 
 enum class Metric : uint8_t {
     L2 = 0,
     IP = 1,
-    Cosine = 2
+    Cosine = 2,
+    IOT = 3       // Involuted Oblate Toroid — sparse fractal metric
 };
 
 struct SearchResult {

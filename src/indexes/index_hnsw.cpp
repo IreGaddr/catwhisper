@@ -34,6 +34,55 @@ static constexpr uint32_t INVALID_NODE = 0xFFFFFFFFu;
 static constexpr size_t BUILD_LOCK_STRIPES = 8192;
 using BuildLockArray = std::array<std::shared_mutex, BUILD_LOCK_STRIPES>;
 
+// ─── int16 dot product (overflow-safe int64 accumulation) ──────────────────
+static int64_t int16_dot(const int16_t* a, const int16_t* b, uint32_t n) {
+#if defined(__AVX512F__)
+    // Process 16 int16 pairs per iteration.
+    // _mm256_madd_epi16 → 8 int32, widen to 8 int64 via _mm512_cvtepi32_epi64.
+    __m512i acc = _mm512_setzero_si512();  // 8 int64 accumulators
+    uint32_t i = 0;
+    for (; i + 16u <= n; i += 16u) {
+        const __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
+        const __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i));
+        const __m256i prod32 = _mm256_madd_epi16(va, vb);       // 8 int32
+        const __m512i prod64 = _mm512_cvtepi32_epi64(prod32);   // widen to 8 int64
+        acc = _mm512_add_epi64(acc, prod64);
+    }
+    int64_t result = _mm512_reduce_add_epi64(acc);
+    for (; i < n; ++i) {
+        result += static_cast<int64_t>(a[i]) * static_cast<int64_t>(b[i]);
+    }
+    return result;
+#elif defined(__AVX2__)
+    __m256i acc_lo = _mm256_setzero_si256();  // 4 int64
+    __m256i acc_hi = _mm256_setzero_si256();  // 4 int64
+    uint32_t i = 0;
+    for (; i + 16u <= n; i += 16u) {
+        const __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
+        const __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i));
+        const __m256i prod32 = _mm256_madd_epi16(va, vb);       // 8 int32
+        const __m128i lo32 = _mm256_castsi256_si128(prod32);
+        const __m128i hi32 = _mm256_extracti128_si256(prod32, 1);
+        acc_lo = _mm256_add_epi64(acc_lo, _mm256_cvtepi32_epi64(lo32));
+        acc_hi = _mm256_add_epi64(acc_hi, _mm256_cvtepi32_epi64(hi32));
+    }
+    const __m256i sum = _mm256_add_epi64(acc_lo, acc_hi);
+    alignas(32) int64_t vals[4];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(vals), sum);
+    int64_t result = vals[0] + vals[1] + vals[2] + vals[3];
+    for (; i < n; ++i) {
+        result += static_cast<int64_t>(a[i]) * static_cast<int64_t>(b[i]);
+    }
+    return result;
+#else
+    int64_t result = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        result += static_cast<int64_t>(a[i]) * static_cast<int64_t>(b[i]);
+    }
+    return result;
+#endif
+}
+
 struct Node {
     uint32_t id;
     uint32_t level;
@@ -54,6 +103,9 @@ struct IndexHNSW::Impl {
     std::vector<int8_t>  data_int8;   // int8-quantized copy; populated when
                                        // params.use_int8_storage is true. 4× vs fp32.
     float int8_scale = 127.0f;         // = params.int8_scale; quantized = clamp(round(v * scale))
+    std::vector<int16_t> data_int16;   // Native int16 storage; populated when
+                                       // params.use_int16_storage is true. 2× vs fp32.
+    std::vector<int64_t> norms_sq_int16; // Precomputed ||v||² per int16 vector for L2/Cosine.
     std::vector<VectorId> id_mapping;
     std::unordered_set<VectorId> id_set;
 
@@ -73,6 +125,17 @@ struct IndexHNSW::Impl {
     Buffer gpu_distance_buffer;
     Pipeline gpu_distance_pipeline;
     DescriptorSet gpu_distance_desc_set;
+
+    // GPU int16 fused distance+topk pipeline (SoA layout, bitonic sort on GPU)
+    bool gpu_int16_initialized = false;
+    Buffer gpu_int16_data_buffer;      // SoA int16 database on GPU
+    Buffer gpu_int16_query_buffer;     // AoS int16 queries on GPU
+    Buffer gpu_int16_dist_buffer;      // output distances (float)
+    Buffer gpu_int16_idx_buffer;       // output indices (uint32)
+    Pipeline gpu_int16_batch_pipeline;
+    DescriptorSet gpu_int16_batch_desc_set;
+    uint32_t gpu_int16_capacity = 0;   // SoA row stride on GPU
+    uint64_t gpu_int16_n_uploaded = 0; // vectors currently uploaded
 
     float distance(const float* a, const float* b) const {
 #if defined(__AVX512F__)
@@ -143,6 +206,38 @@ struct IndexHNSW::Impl {
         return data.data() + static_cast<size_t>(node_id) * dimension;
     }
 
+    const int16_t* get_vector_int16(uint32_t node_id) const {
+        return data_int16.data() + static_cast<size_t>(node_id) * dimension;
+    }
+
+    // Int16 distance: query (with precomputed norm²) vs stored node.
+    // L2/Cosine: ||a-b||² = ||a||² + ||b||² - 2⟨a,b⟩  (uses precomputed norms)
+    // IP: -⟨a,b⟩
+    float distance_int16_query(const int16_t* query, int64_t query_norm_sq,
+                                uint32_t node_id) const {
+        const int16_t* db = get_vector_int16(node_id);
+        const int64_t dot = int16_dot(query, db, dimension);
+        if (metric == Metric::IP) {
+            return -static_cast<float>(dot);
+        }
+        // L2 (and Cosine): ||q-v||² = ||q||² + ||v||² - 2⟨q,v⟩
+        const int64_t l2_sq = query_norm_sq + norms_sq_int16[node_id] - 2 * dot;
+        return static_cast<float>(l2_sq);
+    }
+
+    // Node-to-node distance, used by shrink_connections and select_neighbors_heuristic.
+    float node_distance(uint32_t a, uint32_t b) const {
+        if (params.use_int16_storage && !data_int16.empty()) {
+            const int16_t* va = get_vector_int16(a);
+            const int16_t* vb = get_vector_int16(b);
+            const int64_t dot = int16_dot(va, vb, dimension);
+            if (metric == Metric::IP) return -static_cast<float>(dot);
+            const int64_t l2_sq = norms_sq_int16[a] + norms_sq_int16[b] - 2 * dot;
+            return static_cast<float>(l2_sq);
+        }
+        return distance(get_vector(a), get_vector(b));
+    }
+
     // BF16 = top 16 bits of float32 (same exponent, 7 mantissa bits instead of 23).
     static uint16_t float_to_bf16(float f) {
         uint32_t bits;
@@ -204,10 +299,29 @@ struct IndexHNSW::Impl {
     static void quantize_f32_to_i8(const float* __restrict__ src,
                                     int8_t*      __restrict__ dst,
                                     uint32_t n, float scale) {
+#if defined(__AVX512F__)
+        // AVX-512: 16 floats → 16 int8 per iteration.
+        // cvt_roundps → epi32, pack epi32 → epi16 → epi8 with saturation.
+        const __m512 vscale = _mm512_set1_ps(scale);
+        uint32_t i = 0;
+        for (; i + 16u <= n; i += 16u) {
+            __m512 vf = _mm512_loadu_ps(src + i);
+            vf = _mm512_mul_ps(vf, vscale);
+            __m512i vi = _mm512_cvt_roundps_epi32(vf, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            // Saturating narrowing: 16 int32 → 16 int8, clamps to [-128,127].
+            __m128i packed = _mm512_cvtsepi32_epi8(vi);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), packed);
+        }
+        for (; i < n; ++i) {
+            int q = static_cast<int>(std::lroundf(src[i] * scale));
+            dst[i] = static_cast<int8_t>(q < -127 ? -127 : q > 127 ? 127 : q);
+        }
+#else
         for (uint32_t i = 0; i < n; ++i) {
             int q = static_cast<int>(std::lroundf(src[i] * scale));
             dst[i] = static_cast<int8_t>(q < -127 ? -127 : q > 127 ? 127 : q);
         }
+#endif
     }
 
     // L2 or IP distance between a pre-quantized int8 query and an int8 database vector.
@@ -215,7 +329,103 @@ struct IndexHNSW::Impl {
     float distance_int8_preq(const int8_t* __restrict__ q_i8, uint32_t node_id) const {
         const int8_t* db = data_int8.data() + static_cast<size_t>(node_id) * dimension;
         int32_t result = 0;
-#if defined(__AVX2__)
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+        // AVX-512 VNNI: 64 int8 multiply-accumulates per VPDPBUSD instruction.
+        // VPDPBUSD operates on (unsigned u8) * (signed s8) → int32 accumulation.
+        // Our data is signed int8, so for IP/Cosine we bias the query:
+        //   dot(q, d) = vpdpbusd(q + 128, d) - 128 * sum(d)
+        // For L2, fall back to the int16 widening path (no fused subtract-square in VNNI).
+        if (metric != Metric::L2) {
+            // --- VNNI IP/Cosine path: 64 elements per iteration ---
+            const __m512i bias = _mm512_set1_epi8(static_cast<char>(-128));  // 0x80
+            __m512i sum_dot = _mm512_setzero_si512();
+            __m512i sum_d   = _mm512_setzero_si512();
+            const __m512i ones = _mm512_set1_epi8(1);
+            uint32_t i = 0;
+            for (; i + 64u <= dimension; i += 64u) {
+                __m512i q8 = _mm512_loadu_si512(q_i8 + i);
+                __m512i d8 = _mm512_loadu_si512(db + i);
+                // Bias query from signed [-128,127] to unsigned [0,255]:
+                // Reinterpret xor with 0x80 as uint8 addition of 128.
+                __m512i q_u8 = _mm512_xor_si512(q8, bias);
+                // VPDPBUSD: acc += u8[k] * s8[k] for k in each 4-byte group.
+                sum_dot = _mm512_dpbusd_epi32(sum_dot, q_u8, d8);
+                // Accumulate sum(d) for bias correction using VPDPBUSD with ones:
+                // sum_d += 1 * d8[k] for each byte lane.
+                sum_d = _mm512_dpbusd_epi32(sum_d, ones, d8);
+            }
+            // Handle 32-element remainder with 256-bit VNNI.
+            if (i + 32u <= dimension) {
+                __m256i q8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q_i8 + i));
+                __m256i d8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(db + i));
+                __m256i bias256 = _mm256_set1_epi8(static_cast<char>(-128));
+                __m256i q_u8 = _mm256_xor_si256(q8, bias256);
+                // Widen to 512 for VNNI (zero-extend upper).
+                __m512i q512 = _mm512_castsi256_si512(q_u8);
+                __m512i d512 = _mm512_castsi256_si512(d8);
+                __m512i ones256 = _mm512_castsi256_si512(_mm256_set1_epi8(1));
+                __m512i partial_dot = _mm512_setzero_si512();
+                __m512i partial_d   = _mm512_setzero_si512();
+                partial_dot = _mm512_dpbusd_epi32(partial_dot, q512, d512);
+                partial_d   = _mm512_dpbusd_epi32(partial_d, ones256, d512);
+                // Only lower 256 bits have valid data; extract and add.
+                sum_dot = _mm512_add_epi32(sum_dot,
+                    _mm512_maskz_mov_epi32(0x00FFu, partial_dot));
+                sum_d = _mm512_add_epi32(sum_d,
+                    _mm512_maskz_mov_epi32(0x00FFu, partial_d));
+                i += 32u;
+            }
+            // Horizontal reduction.
+            int32_t biased_dot = _mm512_reduce_add_epi32(sum_dot);
+            int32_t d_sum      = _mm512_reduce_add_epi32(sum_d);
+            // Scalar tail.
+            for (; i < dimension; ++i) {
+                biased_dot += (static_cast<uint8_t>(q_i8[i] ^ static_cast<int8_t>(-128)))
+                              * static_cast<int32_t>(db[i]);
+                d_sum += db[i];
+            }
+            // Undo bias: dot(q, d) = biased_dot - 128 * sum(d).
+            result = biased_dot - 128 * d_sum;
+        } else {
+            // --- L2 path: keep int16 widening (no VNNI advantage for subtract-square) ---
+            __m512i sum512 = _mm512_setzero_si512();
+            uint32_t i = 0;
+            for (; i + 32u <= dimension; i += 32u) {
+                __m256i q8  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q_i8 + i));
+                __m256i d8  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(db + i));
+                __m512i q16 = _mm512_cvtepi8_epi16(q8);
+                __m512i d16 = _mm512_cvtepi8_epi16(d8);
+                __m512i diff = _mm512_sub_epi16(q16, d16);
+                sum512 = _mm512_add_epi32(sum512, _mm512_madd_epi16(diff, diff));
+            }
+            result = _mm512_reduce_add_epi32(sum512);
+            for (; i < dimension; ++i) {
+                int32_t qi = q_i8[i], di = db[i];
+                result += (qi - di) * (qi - di);
+            }
+        }
+#elif defined(__AVX512BW__)
+        // AVX-512 without VNNI: 32 int8 per iteration via int16 widening.
+        __m512i sum512 = _mm512_setzero_si512();
+        uint32_t i = 0;
+        for (; i + 32u <= dimension; i += 32u) {
+            __m256i q8  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q_i8 + i));
+            __m256i d8  = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(db + i));
+            __m512i q16 = _mm512_cvtepi8_epi16(q8);
+            __m512i d16 = _mm512_cvtepi8_epi16(d8);
+            if (metric == Metric::L2) {
+                __m512i diff = _mm512_sub_epi16(q16, d16);
+                sum512 = _mm512_add_epi32(sum512, _mm512_madd_epi16(diff, diff));
+            } else {
+                sum512 = _mm512_add_epi32(sum512, _mm512_madd_epi16(q16, d16));
+            }
+        }
+        result = _mm512_reduce_add_epi32(sum512);
+        for (; i < dimension; ++i) {
+            int32_t qi = q_i8[i], di = db[i];
+            result += (metric == Metric::L2) ? (qi - di) * (qi - di) : qi * di;
+        }
+#elif defined(__AVX2__)
         __m256i sum32 = _mm256_setzero_si256();
         uint32_t i = 0;
         for (; i + 16u <= dimension; i += 16u) {
@@ -266,7 +476,9 @@ struct IndexHNSW::Impl {
     std::vector<std::pair<float, uint32_t>>
     search_layer(const float* query, uint32_t layer, uint32_t ef,
                  const std::vector<uint32_t>& entry_points,
-                 BuildLockArray* build_locks = nullptr) {
+                 BuildLockArray* build_locks = nullptr,
+                 const int16_t* query_i16 = nullptr,
+                 int64_t query_norm_sq_i16 = 0) {
         std::unordered_set<uint32_t> visited;
         visited.reserve(ef * 4);
 
@@ -274,14 +486,16 @@ struct IndexHNSW::Impl {
         MaxHeap results;     // max-heap: largest dist on top
         std::vector<uint32_t> neighbors_snapshot;
 
-        const bool int8_mode = params.use_int8_storage && !data_int8.empty();
-        const bool bf16_mode = params.use_bf16_storage && !data_bf16.empty() && !int8_mode;
+        const bool int16_mode = query_i16 != nullptr && !data_int16.empty();
+        const bool int8_mode = !int16_mode && params.use_int8_storage && !data_int8.empty();
+        const bool bf16_mode = !int16_mode && params.use_bf16_storage && !data_bf16.empty() && !int8_mode;
         std::vector<int8_t> query_i8;
         if (int8_mode) {
             query_i8.resize(dimension);
             quantize_f32_to_i8(query, query_i8.data(), dimension, int8_scale);
         }
         auto node_dist = [&](uint32_t node_id) -> float {
+            if (int16_mode) return distance_int16_query(query_i16, query_norm_sq_i16, node_id);
             if (int8_mode)  return distance_int8_preq(query_i8.data(), node_id);
             if (bf16_mode)  return distance_bf16(query, node_id);
             return distance(query, get_vector(node_id));
@@ -384,10 +598,9 @@ struct IndexHNSW::Impl {
             if (selected.size() >= M) break;
 
             bool good = true;
-            const float* c_vec = get_vector(c_id);
 
             for (const auto& [s_dist, s_id] : selected) {
-                float d = distance(c_vec, get_vector(s_id));
+                float d = node_distance(c_id, s_id);
                 if (d < c_dist) {
                     good = false;
                     break;
@@ -419,9 +632,8 @@ struct IndexHNSW::Impl {
         if (layer >= node.neighbors.size() || node.neighbors[layer].size() <= max_conn) return;
 
         std::vector<std::pair<float, uint32_t>> candidates;
-        const float* node_vec = get_vector(node_id);
         for (uint32_t n : node.neighbors[layer]) {
-            candidates.emplace_back(distance(node_vec, get_vector(n)), n);
+            candidates.emplace_back(node_distance(node_id, n), n);
         }
 
         select_neighbors_simple(candidates, max_conn);
@@ -437,9 +649,8 @@ struct IndexHNSW::Impl {
         if (layer >= node.neighbors.size() || node.neighbors[layer].size() <= max_conn) return;
 
         std::vector<std::pair<float, uint32_t>> candidates;
-        const float* node_vec = get_vector(node_id);
         for (uint32_t n : node.neighbors[layer]) {
-            candidates.emplace_back(distance(node_vec, get_vector(n)), n);
+            candidates.emplace_back(node_distance(node_id, n), n);
         }
 
         select_neighbors_heuristic(node_id, candidates, max_conn);
@@ -617,12 +828,39 @@ Expected<IndexHNSW> IndexHNSW::create_gpu(Context& ctx, uint32_t dimension,
     }
     index.impl_->gpu_distance_desc_set = std::move(*desc_result);
     index.impl_->gpu_initialized = true;
-    
+
+    // Create int16 fused batch pipeline if int16 storage is enabled
+    if (params.use_int16_storage) {
+        PipelineDesc i16_desc;
+        i16_desc.shader_name = "distance_topk_batch_int16";
+        i16_desc.bindings = {
+            {0, DescriptorBinding::StorageBuffer},  // database (int16 SoA)
+            {1, DescriptorBinding::StorageBuffer},  // queries (int16 AoS)
+            {2, DescriptorBinding::StorageBuffer},  // out_distances (float)
+            {3, DescriptorBinding::StorageBuffer},  // out_indices (uint)
+        };
+        i16_desc.push_constant_size = 24;  // n_vectors, dimension, k, n_queries, metric, capacity
+
+        auto i16_pipeline = Pipeline::create(ctx, i16_desc);
+        if (i16_pipeline) {
+            auto i16_desc_set = DescriptorSet::create(ctx, *i16_pipeline);
+            if (i16_desc_set) {
+                index.impl_->gpu_int16_batch_pipeline = std::move(*i16_pipeline);
+                index.impl_->gpu_int16_batch_desc_set = std::move(*i16_desc_set);
+                index.impl_->gpu_int16_initialized = true;
+            }
+        }
+    }
+
     return index;
 }
 
 bool IndexHNSW::gpu_enabled() const {
     return impl_ && impl_->gpu_initialized && impl_->gpu_options.enable;
+}
+
+bool IndexHNSW::gpu_int16_enabled() const {
+    return impl_ && impl_->gpu_int16_initialized && impl_->gpu_options.enable;
 }
 
 uint32_t IndexHNSW::dimension() const {
@@ -958,6 +1196,272 @@ Expected<void> IndexHNSW::add(std::span<const float> data, uint64_t n,
     return {};
 }
 
+Expected<void> IndexHNSW::add_int16(std::span<const int16_t> data, uint64_t n,
+                                     std::span<const VectorId> ids) {
+    if (!impl_) {
+        return make_unexpected(ErrorCode::InvalidParameter, "Index not initialized");
+    }
+
+    const uint32_t dim = impl_->dimension;
+    const uint64_t expected_size = n * dim;
+    if (data.size() < expected_size) {
+        return make_unexpected(ErrorCode::InvalidParameter, "Data size mismatch");
+    }
+
+    if (n == 0) return {};
+
+    if (!impl_->params.use_int16_storage) {
+        // Fallback: convert to float and use normal add.
+        return IndexBase::add_int16(data, n, ids);
+    }
+
+    std::unique_lock lock(impl_->mutex);
+
+    const uint64_t start_id = impl_->n_vectors;
+    const bool auto_ids = ids.empty();
+
+    // Store int16 data + precompute norms.
+    {
+        const size_t old_i16_size = impl_->data_int16.size();
+        impl_->data_int16.resize(old_i16_size + static_cast<size_t>(n) * dim);
+        std::memcpy(impl_->data_int16.data() + old_i16_size,
+                    data.data(),
+                    static_cast<size_t>(n) * dim * sizeof(int16_t));
+
+        const size_t old_norms_size = impl_->norms_sq_int16.size();
+        impl_->norms_sq_int16.resize(old_norms_size + static_cast<size_t>(n));
+        for (uint64_t i = 0; i < n; ++i) {
+            const int16_t* vec = data.data() + i * dim;
+            impl_->norms_sq_int16[old_norms_size + i] = int16_dot(vec, vec, dim);
+        }
+    }
+
+    // Also store float data for GPU path compatibility.
+    {
+        const size_t old_data_size = impl_->data.size();
+        impl_->data.resize(old_data_size + static_cast<size_t>(n) * dim);
+        float* dst = impl_->data.data() + old_data_size;
+        for (uint64_t i = 0; i < n * dim; ++i) {
+            dst[i] = static_cast<float>(data[i]);
+        }
+    }
+
+    // Build ID mappings.
+    std::vector<uint32_t> new_node_ids(n, INVALID_NODE);
+    std::vector<uint32_t> new_levels(n);
+    uint64_t inserted = 0;
+
+    if (auto_ids) {
+        const size_t old_id_size = impl_->id_mapping.size();
+        impl_->id_mapping.resize(old_id_size + static_cast<size_t>(n));
+        for (uint64_t i = 0; i < n; ++i) {
+            impl_->id_mapping[old_id_size + i] =
+                static_cast<VectorId>(start_id + i);
+        }
+
+        const size_t old_node_size = impl_->nodes.size();
+        impl_->nodes.resize(old_node_size + static_cast<size_t>(n));
+        for (uint64_t i = 0; i < n; ++i) {
+            uint32_t level = impl_->random_level();
+            level = std::min(level, MAX_LAYERS - 1);
+            new_levels[i] = level;
+
+            const uint32_t node_id = static_cast<uint32_t>(start_id + i);
+            new_node_ids[i] = node_id;
+
+            Node& node = impl_->nodes[static_cast<size_t>(node_id)];
+            node.id = node_id;
+            node.level = level;
+            node.neighbors.clear();
+            node.neighbors.resize(level + 1);
+            for (uint32_t l = 0; l <= level; ++l) {
+                const uint32_t max_conn = (l == 0) ? impl_->params.M * 2 : impl_->params.M;
+                node.neighbors[l].reserve(max_conn * 4);
+            }
+        }
+
+        impl_->n_vectors += n;
+        inserted = n;
+    } else {
+        for (uint64_t i = 0; i < n; ++i) {
+            VectorId id = ids[i];
+            if (impl_->id_set.count(id)) continue;
+
+            impl_->id_mapping.push_back(id);
+            impl_->id_set.insert(id);
+
+            uint32_t level = impl_->random_level();
+            level = std::min(level, MAX_LAYERS - 1);
+            new_levels[i] = level;
+
+            uint32_t node_id = static_cast<uint32_t>(impl_->n_vectors);
+            new_node_ids[i] = node_id;
+
+            Node node;
+            node.id = node_id;
+            node.level = level;
+            node.neighbors.resize(level + 1);
+            for (uint32_t l = 0; l <= level; ++l) {
+                const uint32_t max_conn = (l == 0) ? impl_->params.M * 2 : impl_->params.M;
+                node.neighbors[l].reserve(max_conn * 4);
+            }
+            impl_->nodes.push_back(std::move(node));
+            impl_->n_vectors++;
+            inserted++;
+        }
+    }
+
+    if (inserted == 0) return {};
+
+    if (impl_->entry_point == INVALID_NODE && impl_->n_vectors > 0) {
+        uint32_t max_lvl = 0;
+        uint32_t max_node = INVALID_NODE;
+        for (size_t i = 0; i < new_levels.size(); ++i) {
+            if (new_node_ids[i] == INVALID_NODE) continue;
+            if (max_node == INVALID_NODE || new_levels[i] > max_lvl) {
+                max_lvl = new_levels[i];
+                max_node = new_node_ids[i];
+            }
+        }
+        if (max_node != INVALID_NODE) {
+            impl_->entry_point = max_node;
+            impl_->max_level = max_lvl;
+        }
+    }
+
+    // ── Build HNSW connectivity (using int16 distance) ──
+    const uint32_t entry_point = impl_->entry_point;
+    const int max_search_level = static_cast<int>(impl_->max_level);
+    uint32_t num_threads = std::min(std::thread::hardware_concurrency(),
+                                     static_cast<uint32_t>(std::min<uint64_t>(inserted, n)));
+#ifdef _OPENMP
+    num_threads = std::min(num_threads, static_cast<uint32_t>(std::max(1, omp_get_max_threads())));
+#endif
+    if (num_threads == 0) num_threads = 1;
+
+    if (entry_point != INVALID_NODE && inserted > 1) {
+        BuildLockArray build_locks;
+
+        auto stripe_idx = [](uint32_t nid) -> size_t {
+            return static_cast<size_t>(nid) & (BUILD_LOCK_STRIPES - 1);
+        };
+
+        auto connect_node_parallel = [&](uint32_t node_id, uint32_t level) {
+            if (node_id == INVALID_NODE || node_id == entry_point) return;
+
+            const int16_t* vec_i16 = impl_->get_vector_int16(node_id);
+            const int64_t vec_norm_sq = impl_->norms_sq_int16[node_id];
+            std::vector<uint32_t> ep_set = {entry_point};
+
+            for (int lc = max_search_level; lc > static_cast<int>(level); --lc) {
+                auto results = impl_->search_layer(nullptr, static_cast<uint32_t>(lc), 1,
+                                                    ep_set, &build_locks, vec_i16, vec_norm_sq);
+                if (!results.empty()) ep_set = {results[0].second};
+            }
+
+            struct LayerSelection {
+                uint32_t layer = 0;
+                uint32_t max_conn = 0;
+                std::vector<uint32_t> neighbors;
+            };
+            std::vector<LayerSelection> selections;
+            selections.reserve(static_cast<size_t>(std::min(static_cast<int>(level), max_search_level) + 1));
+
+            for (int lc = std::min(static_cast<int>(level), max_search_level); lc >= 0; --lc) {
+                const uint32_t max_conn = (lc == 0) ? impl_->params.M * 2 : impl_->params.M;
+
+                auto results = impl_->search_layer(nullptr, static_cast<uint32_t>(lc),
+                                                    impl_->params.ef_construction, ep_set,
+                                                    &build_locks, vec_i16, vec_norm_sq);
+
+                std::vector<std::pair<float, uint32_t>> candidates;
+                candidates.reserve(results.size());
+                for (const auto& r : results) candidates.push_back(r);
+                impl_->select_neighbors_simple(candidates, max_conn);
+
+                LayerSelection sel;
+                sel.layer = static_cast<uint32_t>(lc);
+                sel.max_conn = max_conn;
+                sel.neighbors.reserve(candidates.size());
+                for (const auto& [_, n_id] : candidates) sel.neighbors.push_back(n_id);
+                if (!sel.neighbors.empty()) ep_set = sel.neighbors;
+                selections.push_back(std::move(sel));
+            }
+
+            for (const auto& sel : selections) {
+                const size_t node_stripe = stripe_idx(node_id);
+                {
+                    std::unique_lock<std::shared_mutex> guard(build_locks[node_stripe]);
+                    auto& node_neighbors = impl_->nodes[node_id].neighbors[sel.layer];
+                    node_neighbors.reserve(node_neighbors.size() + sel.neighbors.size());
+                    for (uint32_t n_id : sel.neighbors) node_neighbors.push_back(n_id);
+                }
+                for (uint32_t n_id : sel.neighbors) {
+                    const size_t neighbor_stripe = stripe_idx(n_id);
+                    std::unique_lock<std::shared_mutex> guard(build_locks[neighbor_stripe]);
+                    Node& neighbor_node = impl_->nodes[n_id];
+                    if (sel.layer >= static_cast<uint32_t>(neighbor_node.neighbors.size())) {
+                        neighbor_node.neighbors.resize(static_cast<size_t>(sel.layer) + 1);
+                    }
+                    auto& back_neighbors = neighbor_node.neighbors[sel.layer];
+                    back_neighbors.push_back(node_id);
+                    if (back_neighbors.size() > (static_cast<size_t>(sel.max_conn) * 2)) {
+                        impl_->shrink_connections(n_id, sel.layer, sel.max_conn);
+                    }
+                }
+            }
+        };
+
+        if (inserted < 100 || num_threads == 1) {
+            for (uint64_t i = 0; i < n; ++i) {
+                if (new_node_ids[i] == INVALID_NODE) continue;
+                connect_node_parallel(new_node_ids[i], new_levels[i]);
+            }
+        }
+#ifdef _OPENMP
+        else {
+#pragma omp parallel for schedule(dynamic, 64) num_threads(num_threads)
+            for (int64_t idx = 0; idx < static_cast<int64_t>(n); ++idx) {
+                const uint64_t uidx = static_cast<uint64_t>(idx);
+                if (new_node_ids[uidx] == INVALID_NODE) continue;
+                connect_node_parallel(new_node_ids[uidx], new_levels[uidx]);
+            }
+        }
+#else
+        else {
+            std::atomic<uint64_t> next_idx{0};
+            auto worker = [&]() {
+                while (true) {
+                    const uint64_t idx = next_idx.fetch_add(1, std::memory_order_relaxed);
+                    if (idx >= n) break;
+                    if (new_node_ids[idx] == INVALID_NODE) continue;
+                    connect_node_parallel(new_node_ids[idx], new_levels[idx]);
+                }
+            };
+            std::vector<std::thread> threads;
+            threads.reserve(num_threads - 1);
+            for (uint32_t t = 0; t < num_threads - 1; ++t) threads.emplace_back(worker);
+            worker();
+            for (auto& t : threads) t.join();
+        }
+#endif
+    }
+
+    for (uint64_t i = 0; i < n; ++i) {
+        if (new_node_ids[i] == INVALID_NODE) continue;
+        if (new_levels[i] > impl_->max_level) {
+            impl_->max_level = new_levels[i];
+            impl_->entry_point = new_node_ids[i];
+        }
+    }
+
+    // Invalidate GPU int16 cache so next search re-uploads
+    impl_->gpu_int16_n_uploaded = 0;
+
+    lock.unlock();
+    return {};
+}
+
 void IndexHNSW::connect_node(uint32_t node_id, uint32_t level) {
     if (!impl_ || impl_->entry_point == INVALID_NODE || node_id == impl_->entry_point) return;
     
@@ -1150,6 +1654,104 @@ void IndexHNSW::search_single_locked(const float* query, uint32_t k, SearchResul
     }
 }
 
+Expected<SearchResults> IndexHNSW::search_int16(VectorI16 query, uint32_t k) {
+    if (!impl_) {
+        return make_unexpected(ErrorCode::InvalidParameter, "Index not initialized");
+    }
+    if (query.size() != impl_->dimension) {
+        return make_unexpected(ErrorCode::InvalidDimension, "Query dimension mismatch");
+    }
+
+    SearchResults results(1, k);
+    if (impl_->n_vectors == 0 || impl_->entry_point == INVALID_NODE) {
+        return results;
+    }
+
+    std::shared_lock lock(impl_->mutex);
+    search_single_locked_int16(query.data(),
+                                int16_dot(query.data(), query.data(), impl_->dimension),
+                                k, results.results.data());
+    return results;
+}
+
+Expected<SearchResults> IndexHNSW::search_int16(std::span<const int16_t> queries,
+                                                  uint64_t n_queries, uint32_t k) {
+    if (!impl_) {
+        return make_unexpected(ErrorCode::InvalidParameter, "Index not initialized");
+    }
+    if (impl_->n_vectors == 0) {
+        return SearchResults(n_queries, k);
+    }
+
+    // GPU fast path: fused distance+topk on GPU for large batches
+    if (gpu_int16_enabled() && n_queries >= impl_->gpu_options.batch_threshold) {
+        return search_batch_gpu_int16(queries, n_queries, k);
+    }
+
+    const uint32_t dim = impl_->dimension;
+    SearchResults results(n_queries, k);
+
+    uint32_t num_threads = std::min(std::thread::hardware_concurrency(),
+                                     static_cast<unsigned int>(n_queries));
+    if (num_threads == 0) num_threads = 1;
+
+    if (n_queries <= 4 || num_threads == 1) {
+        std::shared_lock lock(impl_->mutex);
+        for (uint64_t q = 0; q < n_queries; ++q) {
+            const int16_t* qptr = queries.data() + q * dim;
+            search_single_locked_int16(qptr, int16_dot(qptr, qptr, dim),
+                                        k, results.results.data() + q * k);
+        }
+        return results;
+    }
+
+    std::shared_lock lock(impl_->mutex);
+    std::atomic<uint64_t> next_query{0};
+
+    auto worker = [&]() {
+        while (true) {
+            uint64_t q = next_query.fetch_add(1);
+            if (q >= n_queries) break;
+            const int16_t* qptr = queries.data() + q * dim;
+            search_single_locked_int16(qptr, int16_dot(qptr, qptr, dim),
+                                        k, results.results.data() + q * k);
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads - 1);
+    for (uint32_t t = 0; t < num_threads - 1; ++t) {
+        threads.emplace_back(worker);
+    }
+    worker();
+    for (auto& t : threads) t.join();
+
+    return results;
+}
+
+void IndexHNSW::search_single_locked_int16(const int16_t* query, int64_t query_norm_sq,
+                                             uint32_t k, SearchResult* out) {
+    std::vector<uint32_t> ep_set = {impl_->entry_point};
+
+    for (int lc = static_cast<int>(impl_->max_level); lc > 0; --lc) {
+        auto layer_results = impl_->search_layer(nullptr, static_cast<uint32_t>(lc), 1,
+                                                  ep_set, nullptr, query, query_norm_sq);
+        if (!layer_results.empty()) {
+            ep_set = {layer_results[0].second};
+        }
+    }
+
+    uint32_t ef = std::max(ef_search_, k);
+    auto final_results = impl_->search_layer(nullptr, 0, ef, ep_set, nullptr,
+                                              query, query_norm_sq);
+
+    uint32_t actual_k = std::min(k, static_cast<uint32_t>(final_results.size()));
+    for (uint32_t i = 0; i < actual_k; ++i) {
+        out[i].distance = final_results[i].first;
+        out[i].id = impl_->id_mapping[final_results[i].second];
+    }
+}
+
 static uint16_t f32_to_f16(float f) {
     uint32_t x;
     std::memcpy(&x, &f, sizeof(x));
@@ -1320,6 +1922,221 @@ Expected<SearchResults> IndexHNSW::search_batch_gpu(std::span<const float> queri
     return results;
 }
 
+Expected<SearchResults> IndexHNSW::search_batch_gpu_int16(std::span<const int16_t> queries,
+                                                           uint64_t n_queries, uint32_t k) {
+    if (!impl_->ctx || !impl_->gpu_int16_initialized) {
+        return make_unexpected(ErrorCode::OperationFailed, "GPU int16 not initialized");
+    }
+
+    // Hold shared lock for the entire operation: data_int16 can be reallocated
+    // by add_int16 (exclusive lock) on the worker thread, so we must prevent
+    // that while reading from it for the SoA upload.
+    std::shared_lock lock(impl_->mutex);
+
+    const uint32_t dim    = impl_->dimension;
+    const uint64_t n_vecs = impl_->n_vectors;
+    const uint32_t metric_val = (impl_->metric == Metric::L2) ? 0u : 1u;
+
+    // SoA capacity: round up to multiple of 256 for coalesced access
+    uint32_t capacity = static_cast<uint32_t>((n_vecs + 255u) & ~255ull);
+    if (capacity < n_vecs) capacity = static_cast<uint32_t>(n_vecs);
+
+    // 1. Upload database as SoA int16 (re-upload only when stale)
+    if (!impl_->gpu_int16_data_buffer.valid() ||
+        impl_->gpu_int16_n_uploaded != n_vecs ||
+        impl_->gpu_int16_capacity != capacity) {
+
+        uint64_t soa_size = static_cast<uint64_t>(dim) * capacity * sizeof(int16_t);
+
+        BufferDesc data_desc = {};
+        data_desc.size        = soa_size;
+        data_desc.usage       = BufferUsage::Storage | BufferUsage::TransferDst;
+        data_desc.memory_type = MemoryType::Unified;
+
+        auto buf = Buffer::create(*impl_->ctx, data_desc);
+        if (!buf) {
+            return make_unexpected(buf.error().code(), "Failed to create GPU int16 data buffer");
+        }
+        impl_->gpu_int16_data_buffer = std::move(*buf);
+
+        // CPU-side AoS → SoA transpose for upload
+        std::vector<int16_t> soa_data(static_cast<size_t>(dim) * capacity, 0);
+        const int16_t* src = impl_->data_int16.data();
+        for (uint64_t v = 0; v < n_vecs; ++v) {
+            for (uint32_t d = 0; d < dim; ++d) {
+                soa_data[static_cast<size_t>(d) * capacity + v] = src[v * dim + d];
+            }
+        }
+
+        std::vector<uint8_t> bytes(soa_data.size() * sizeof(int16_t));
+        std::memcpy(bytes.data(), soa_data.data(), bytes.size());
+        auto r = impl_->gpu_int16_data_buffer.upload(bytes);
+        if (!r) {
+            return make_unexpected(r.error().code(), "Failed to upload int16 data to GPU");
+        }
+        impl_->gpu_int16_capacity = capacity;
+        impl_->gpu_int16_n_uploaded = n_vecs;
+    }
+
+    // 2. Upload queries (AoS, int16) — one buffer, one transfer
+    {
+        uint64_t q_size = n_queries * dim * sizeof(int16_t);
+        BufferDesc q_desc = {};
+        q_desc.size        = q_size;
+        q_desc.usage       = BufferUsage::Storage | BufferUsage::TransferDst;
+        q_desc.memory_type = MemoryType::Unified;
+
+        auto buf = Buffer::create(*impl_->ctx, q_desc);
+        if (!buf) {
+            return make_unexpected(buf.error().code(), "Failed to create GPU int16 query buffer");
+        }
+        impl_->gpu_int16_query_buffer = std::move(*buf);
+
+        std::vector<uint8_t> bytes(q_size);
+        std::memcpy(bytes.data(), queries.data(), q_size);
+        auto r = impl_->gpu_int16_query_buffer.upload(bytes);
+        if (!r) {
+            return make_unexpected(r.error().code(), "Failed to upload int16 queries to GPU");
+        }
+    }
+
+    // 3. Output buffers: per-chunk top-k distances + indices
+    constexpr uint32_t CHUNK = 2048u;
+    uint32_t n_wg_x = (static_cast<uint32_t>(n_vecs) + CHUNK - 1u) / CHUNK;
+    uint64_t out_count = static_cast<uint64_t>(n_queries) * n_wg_x * k;
+
+    {
+        uint64_t dist_size = out_count * sizeof(float);
+        BufferDesc d_desc = {};
+        d_desc.size        = dist_size;
+        d_desc.usage       = BufferUsage::Storage;
+        d_desc.memory_type = MemoryType::HostReadback;
+
+        auto buf = Buffer::create(*impl_->ctx, d_desc);
+        if (!buf) {
+            return make_unexpected(buf.error().code(), "Failed to create GPU int16 distance buffer");
+        }
+        impl_->gpu_int16_dist_buffer = std::move(*buf);
+    }
+
+    {
+        uint64_t idx_size = out_count * sizeof(uint32_t);
+        BufferDesc i_desc = {};
+        i_desc.size        = idx_size;
+        i_desc.usage       = BufferUsage::Storage;
+        i_desc.memory_type = MemoryType::HostReadback;
+
+        auto buf = Buffer::create(*impl_->ctx, i_desc);
+        if (!buf) {
+            return make_unexpected(buf.error().code(), "Failed to create GPU int16 index buffer");
+        }
+        impl_->gpu_int16_idx_buffer = std::move(*buf);
+    }
+
+    // 4. Bind all four buffers
+    {
+        auto r0 = impl_->gpu_int16_batch_desc_set.bind_buffer(0, impl_->gpu_int16_data_buffer);
+        auto r1 = impl_->gpu_int16_batch_desc_set.bind_buffer(1, impl_->gpu_int16_query_buffer);
+        auto r2 = impl_->gpu_int16_batch_desc_set.bind_buffer(2, impl_->gpu_int16_dist_buffer);
+        auto r3 = impl_->gpu_int16_batch_desc_set.bind_buffer(3, impl_->gpu_int16_idx_buffer);
+        if (!r0 || !r1 || !r2 || !r3) {
+            return make_unexpected(ErrorCode::OperationFailed,
+                                   "Failed to bind int16 descriptor set buffers");
+        }
+    }
+
+    // 5. Dispatch: 2D grid (vector chunks × queries)
+    auto cmd_result = CommandBuffer::create(*impl_->ctx);
+    if (!cmd_result) {
+        return make_unexpected(cmd_result.error().code(), "Failed to create command buffer");
+    }
+    auto cmd = std::move(*cmd_result);
+
+    struct BatchInt16PushConstants {
+        uint32_t n_vectors;
+        uint32_t dimension;
+        uint32_t k;
+        uint32_t n_queries;
+        uint32_t metric;
+        uint32_t capacity;
+    };
+    BatchInt16PushConstants pc = {
+        static_cast<uint32_t>(n_vecs),
+        dim,
+        k,
+        static_cast<uint32_t>(n_queries),
+        metric_val,
+        impl_->gpu_int16_capacity
+    };
+
+    cmd.begin();
+    cmd.bind_pipeline(impl_->gpu_int16_batch_pipeline);
+    cmd.bind_descriptor_set(impl_->gpu_int16_batch_pipeline, impl_->gpu_int16_batch_desc_set);
+    cmd.push_constants(impl_->gpu_int16_batch_pipeline, &pc, sizeof(pc));
+    cmd.dispatch(n_wg_x, static_cast<uint32_t>(n_queries), 1);
+    cmd.barrier();
+    cmd.end();
+
+    auto submit_r = submit_and_wait(*impl_->ctx, cmd);
+    if (!submit_r) {
+        return make_unexpected(submit_r.error().code(), "GPU int16 dispatch failed");
+    }
+
+    // 6. Download results
+    std::vector<float>    gpu_distances(out_count);
+    std::vector<uint32_t> gpu_indices(out_count);
+    {
+        std::vector<uint8_t> raw_d(out_count * sizeof(float));
+        auto dl = impl_->gpu_int16_dist_buffer.download(raw_d);
+        if (!dl) {
+            return make_unexpected(dl.error().code(), "Failed to download int16 distances from GPU");
+        }
+        std::memcpy(gpu_distances.data(), raw_d.data(), raw_d.size());
+
+        std::vector<uint8_t> raw_i(out_count * sizeof(uint32_t));
+        dl = impl_->gpu_int16_idx_buffer.download(raw_i);
+        if (!dl) {
+            return make_unexpected(dl.error().code(), "Failed to download int16 indices from GPU");
+        }
+        std::memcpy(gpu_indices.data(), raw_i.data(), raw_i.size());
+    }
+
+    // 7. Merge per-chunk top-k results for each query
+    SearchResults results(n_queries, k);
+
+    for (uint64_t q = 0; q < n_queries; ++q) {
+        // Collect all chunk results for this query
+        struct Candidate { float dist; uint32_t idx; };
+        std::vector<Candidate> candidates;
+        candidates.reserve(static_cast<size_t>(n_wg_x) * k);
+
+        for (uint32_t wg = 0; wg < n_wg_x; ++wg) {
+            uint64_t base = (q * n_wg_x + wg) * k;
+            for (uint32_t i = 0; i < k; ++i) {
+                uint32_t raw_idx = gpu_indices[base + i];
+                if (raw_idx != 0xFFFFFFFFu && raw_idx < n_vecs) {
+                    candidates.push_back({gpu_distances[base + i], raw_idx});
+                }
+            }
+        }
+
+        uint32_t actual_k = std::min(k, static_cast<uint32_t>(candidates.size()));
+        std::partial_sort(candidates.begin(), candidates.begin() + actual_k,
+                          candidates.end(),
+                          [](const Candidate& a, const Candidate& b) {
+                              return a.dist < b.dist;
+                          });
+
+        SearchResult* out = results.results.data() + q * k;
+        for (uint32_t i = 0; i < actual_k; ++i) {
+            out[i].distance = candidates[i].dist;
+            out[i].id       = impl_->id_mapping[candidates[i].idx];
+        }
+    }
+
+    return results;
+}
+
 Expected<void> IndexHNSW::save(const std::filesystem::path& path) const {
     if (!impl_) {
         return make_unexpected(ErrorCode::InvalidParameter, "Index not initialized");
@@ -1459,6 +2276,22 @@ Expected<void> IndexHNSW::load(const std::filesystem::path& path) {
                                   impl_->int8_scale);
     }
 
+    // Rebuild int16 cache + norms from float data.
+    if (impl_->params.use_int16_storage) {
+        const size_t total = impl_->data.size();
+        const uint32_t dim = impl_->dimension;
+        impl_->data_int16.resize(total);
+        for (size_t i = 0; i < total; ++i) {
+            impl_->data_int16[i] = static_cast<int16_t>(impl_->data[i]);
+        }
+        const size_t n_vecs = impl_->n_vectors;
+        impl_->norms_sq_int16.resize(n_vecs);
+        for (size_t v = 0; v < n_vecs; ++v) {
+            const int16_t* vec = impl_->data_int16.data() + v * dim;
+            impl_->norms_sq_int16[v] = int16_dot(vec, vec, dim);
+        }
+    }
+
     return {};
 }
 
@@ -1469,6 +2302,8 @@ void IndexHNSW::reset() {
         impl_->data.clear();
         impl_->data_bf16.clear();
         impl_->data_int8.clear();
+        impl_->data_int16.clear();
+        impl_->norms_sq_int16.clear();
         impl_->nodes.clear();
         impl_->id_mapping.clear();
         impl_->id_set.clear();

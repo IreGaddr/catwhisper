@@ -16,13 +16,18 @@ set(SHADER_SOURCES
     distance_topk_amd.comp
     distance_topk_fused_int8.comp
     distance_topk_batch_int8.comp
+    distance_topk_fused_int16.comp
+    distance_topk_batch_int16.comp
     transpose_add.comp
     transpose_add_int8.comp
+    transpose_add_int16.comp
     soa_repack.comp
     soa_repack_int8.comp
+    soa_repack_int16.comp
     ivf_distance.comp
     assign_clusters.comp
     pq_distance.comp
+    hamming_topk_batch.comp
 )
 
 set(SHADER_OUTPUTS "")

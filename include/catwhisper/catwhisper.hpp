@@ -13,6 +13,14 @@
 #include <catwhisper/index_ivf_pq.hpp>
 #include <catwhisper/index_hnsw.hpp>
 #include <catwhisper/distance.hpp>
+#include <catwhisper/sparse_vector.hpp>
+#include <catwhisper/distance_iot.hpp>
+#include <catwhisper/index_sparse_iot.hpp>
+
+#ifdef CW_HAS_NPU
+#include <catwhisper/npu_backend.hpp>
+#include <catwhisper/index_flat_npu.hpp>
+#endif
 
 namespace catwhisper = cw;
 

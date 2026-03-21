@@ -16,8 +16,10 @@ option(CW_BUILD_EXAMPLES "Build example programs" ON)
 option(CW_BUILD_SHARED "Build shared library" ON)
 option(CW_USE_SYSTEM_VMA "Use system-provided VMA" OFF)
 option(CW_ENABLE_VALIDATION "Enable Vulkan validation (debug only)" ON)
+option(CW_ENABLE_NPU "Enable AMD XDNA NPU backend for batch similarity" OFF)
 
 find_package(Vulkan REQUIRED)
+find_package(OpenMP)
 
 if(CW_USE_SYSTEM_VMA)
     find_package(VulkanMemoryAllocator REQUIRED)
@@ -34,6 +36,12 @@ endif()
 
 file(GLOB_RECURSE CW_SOURCES "src/*.cpp")
 file(GLOB_RECURSE CW_HEADERS "include/*.hpp")
+
+# NPU backend: conditionally include/exclude sources.
+if(NOT CW_ENABLE_NPU)
+    list(FILTER CW_SOURCES EXCLUDE REGEX "src/npu/.*\\.cpp$")
+    list(FILTER CW_HEADERS EXCLUDE REGEX "npu_backend\\.hpp$|index_flat_npu\\.hpp$")
+endif()
 
 if(CW_BUILD_SHARED)
     add_library(catwhisper SHARED ${CW_SOURCES} ${CW_HEADERS})
@@ -55,6 +63,10 @@ target_link_libraries(catwhisper
     PUBLIC
         Vulkan::Vulkan
 )
+
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(catwhisper PRIVATE OpenMP::OpenMP_CXX)
+endif()
 
 # VMA linking (header-only with VMA_IMPLEMENTATION in buffer.cpp)
 FetchContent_GetProperties(VMA)
@@ -95,18 +107,43 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         $<$<CONFIG:Release>:-fno-plt>
         $<$<CONFIG:Release>:-funroll-loops>
     )
-    # Enable AVX512, F16C, and other SIMD extensions
+    # Enable AVX512, F16C, VNNI, and other SIMD extensions
     target_compile_options(catwhisper PRIVATE
         $<$<CONFIG:Release>:-mavx512f>
         $<$<CONFIG:Release>:-mavx512dq>
         $<$<CONFIG:Release>:-mavx512vl>
         $<$<CONFIG:Release>:-mavx512bw>
         $<$<CONFIG:Release>:-mavx512bf16>
+        $<$<CONFIG:Release>:-mavx512vnni>
         $<$<CONFIG:Release>:-mf16c>
         $<$<CONFIG:Release>:-mfma>
     )
 elseif(MSVC)
     target_compile_options(catwhisper PRIVATE /W4 /wd4100 /fp:fast)
+endif()
+
+# NPU (AMD XDNA) support
+if(CW_ENABLE_NPU)
+    # Look for XDNA driver headers / Ryzen AI SDK.
+    find_path(XDNA_INCLUDE_DIR
+        NAMES "xrt/xrt_device.h" "amdxdna_accel.h"
+        PATHS /usr/include /usr/local/include /opt/xilinx/xrt/include
+    )
+    find_library(XDNA_LIBRARY
+        NAMES xrt_coreutil xrt_core
+        PATHS /usr/lib /usr/local/lib /opt/xilinx/xrt/lib
+    )
+
+    if(XDNA_INCLUDE_DIR AND XDNA_LIBRARY)
+        message(STATUS "AMD XDNA NPU support enabled (SDK: ${XDNA_INCLUDE_DIR})")
+        target_compile_definitions(catwhisper PUBLIC CW_HAS_NPU=1)
+        target_include_directories(catwhisper PRIVATE ${XDNA_INCLUDE_DIR})
+        target_link_libraries(catwhisper PRIVATE ${XDNA_LIBRARY})
+    else()
+        message(STATUS "AMD XDNA NPU: SDK not found, building NPU backend with CPU reference kernels")
+        message(STATUS "  Install Ryzen AI SDK or amdxdna driver for hardware acceleration")
+        # Still compile NPU sources but without CW_HAS_NPU -- uses CPU reference path.
+    endif()
 endif()
 
 add_subdirectory(shaders)

@@ -54,6 +54,8 @@ public:
     friend class CommandBuffer;
     friend class DescriptorSet;
     friend Expected<void> submit_and_wait(Context&, CommandBuffer&);
+    friend Expected<uint64_t> submit_async(Context&, CommandBuffer&);
+    friend Expected<void> wait_timeline(Context&, uint64_t);
 
 private:
     Context() = default;

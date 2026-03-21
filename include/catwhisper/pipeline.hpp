@@ -108,6 +108,7 @@ public:
     bool valid() const { return impl_ != nullptr; }
 
     friend Expected<void> submit_and_wait(Context&, CommandBuffer&);
+    friend Expected<uint64_t> submit_async(Context&, CommandBuffer&);
 
 private:
     struct Impl;
@@ -115,6 +116,12 @@ private:
 };
 
 Expected<void> submit_and_wait(Context& ctx, CommandBuffer& cmd);
+
+// Submit without waiting.  Returns the timeline semaphore value to wait on.
+Expected<uint64_t> submit_async(Context& ctx, CommandBuffer& cmd);
+
+// Block until the timeline semaphore reaches `value`.
+Expected<void> wait_timeline(Context& ctx, uint64_t value);
 
 } // namespace cw
 

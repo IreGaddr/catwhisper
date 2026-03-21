@@ -475,4 +475,62 @@ Expected<void> submit_and_wait(Context& ctx, CommandBuffer& cmd) {
     return {};
 }
 
+Expected<uint64_t> submit_async(Context& ctx, CommandBuffer& cmd) {
+    uint64_t signal_value = ++ctx.impl_->compute_timeline_value;
+
+    VkTimelineSemaphoreSubmitInfo timeline_submit = {};
+    timeline_submit.sType                    = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+    timeline_submit.signalSemaphoreValueCount = 1;
+    timeline_submit.pSignalSemaphoreValues   = &signal_value;
+
+    VkSubmitInfo submit_info = {};
+    submit_info.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.pNext                = &timeline_submit;
+    submit_info.commandBufferCount   = 1;
+    submit_info.pCommandBuffers      = &cmd.impl_->cmd;
+    submit_info.signalSemaphoreCount = 1;
+    submit_info.pSignalSemaphores    = &ctx.impl_->compute_timeline_semaphore;
+
+    if (vkQueueSubmit(ctx.impl_->compute_queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) {
+        return make_unexpected(ErrorCode::OperationFailed, "Failed to submit queue");
+    }
+
+    return signal_value;
+}
+
+Expected<void> wait_timeline(Context& ctx, uint64_t value) {
+    // Fast path: check if already signaled
+    uint64_t current = 0;
+    if (vkGetSemaphoreCounterValue(ctx.impl_->device,
+                                   ctx.impl_->compute_timeline_semaphore,
+                                   &current) == VK_SUCCESS
+        && current >= value) {
+        return {};
+    }
+
+    // Spin-poll (same strategy as submit_and_wait)
+    static constexpr uint32_t SPIN_LIMIT = 2000000u;
+    for (uint32_t spin = 0; spin < SPIN_LIMIT; ++spin) {
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#endif
+        if (vkGetSemaphoreCounterValue(ctx.impl_->device,
+                                       ctx.impl_->compute_timeline_semaphore,
+                                       &current) == VK_SUCCESS
+            && current >= value) {
+            return {};
+        }
+    }
+
+    // Fallback: blocking wait
+    VkSemaphoreWaitInfo wait_info = {};
+    wait_info.sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    wait_info.semaphoreCount = 1;
+    wait_info.pSemaphores    = &ctx.impl_->compute_timeline_semaphore;
+    wait_info.pValues        = &value;
+
+    vkWaitSemaphores(ctx.impl_->device, &wait_info, UINT64_MAX);
+    return {};
+}
+
 } // namespace cw

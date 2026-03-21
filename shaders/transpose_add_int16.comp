@@ -1,0 +1,37 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+
+// AoS → SoA transpose for int16 vector ingestion.
+//
+// Reads new int16 vectors from a host-visible staging buffer in row-major (AoS)
+// layout and writes them into the SoA database buffer at the correct offsets.
+//
+// SoA layout:  database[dimension_idx * capacity + vector_idx]
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer StagingBuffer {
+    int16_t staging[];
+};
+
+layout(set = 0, binding = 1) buffer DatabaseBuffer {
+    int16_t database[];
+};
+
+layout(push_constant) uniform PC {
+    uint n_new;       // number of vectors being added this call
+    uint dim;         // vector dimension
+    uint n_existing;  // vectors already present in the database
+    uint capacity;    // database buffer capacity (SoA row stride)
+};
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= n_new * dim) return;
+
+    uint v = gid % n_new;
+    uint d = gid / n_new;
+
+    int16_t val = staging[v * dim + d];
+    database[d * capacity + (n_existing + v)] = val;
+}
