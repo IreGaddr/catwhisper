@@ -1,0 +1,51 @@
+\section{The IOT Metric Space}
+\label{sec:iot_metric}
+
+\subsection{Construction}
+
+The Involuted Oblate Toroid (IOT) metric space in $d$ dimensions is constructed from $d$ copies of the torus $T^2$, each parameterized by a pair of angles $(u_i, v_i)$ with shared radii $R$ and $r$. A point on the $d$-dimensional IOT manifold is:
+\begin{equation}
+    p = \{(u_1, v_1, \rho_1, \phi_1, c_1), \ldots, (u_d, v_d, \rho_d, \phi_d, c_d)\}
+\end{equation}
+where $u_i, v_i \in [0, 2\pi)$ are angular coordinates, $\rho_i \in [0,1]$ is an oblate radius parameter, $\phi_i \in [-1,1]$ is an involution phase, and $c_i \in [0,1]$ is a confidence parameter. In the simplified analysis presented here, we focus on the angular coordinates $(u_i, v_i)$ which carry the essential geometric content.
+
+\subsection{Metric Tensor}
+
+The metric tensor is block-diagonal with $d$ blocks of size $2 \times 2$:
+\begin{equation}
+    G = \text{diag}(G_1, G_2, \ldots, G_d)
+\end{equation}
+where each block is:
+\begin{equation}
+    G_i = \begin{pmatrix}
+        (R + r\cos v_i)^2 + w_i & \frac{1}{2}\rho_i \\
+        \frac{1}{2}\rho_i & r^2 + w_i
+    \end{pmatrix}
+    \label{eq:metric_block}
+\end{equation}
+
+Here $w_i$ is a warping term derived from harmonic functions of the angular coordinates, and $\rho_i$ is a rotation coupling. For the unwarped analysis ($w_i = 0$, $\rho_i = 0$):
+\begin{equation}
+    \sqrt{\det G_i} = r(R + r\cos v_i)
+\end{equation}
+
+\subsection{The Involution}
+
+The IOT involution $\mathcal{I}: T^d \to T^d$ is defined per-dimension as:
+\begin{equation}
+    \mathcal{I}(u_i, v_i) = (u_i + \pi, \; -v_i)
+    \label{eq:involution}
+\end{equation}
+
+This maps the outer edge ($v_i = 0$, where the volume element is maximal) to the inner edge ($v_i = \pi$, where it is minimal), and vice versa. The involution is an isometry of the flat torus but \emph{not} of the embedded torus---it exchanges regions of different curvature.
+
+\subsection{IOT Distance}
+
+The IOT distance between points $a$ and $b$ is:
+\begin{equation}
+    d_{\text{IOT}}(a, b) = \min\!\big(d_{\text{direct}}(a, b), \; \alpha \cdot d_{\text{direct}}(a, \mathcal{I}(b)) + \beta\big)
+    \label{eq:iot_distance}
+\end{equation}
+where $\alpha < 1$ and $\beta > 0$ are constants ($\alpha = 0.92$, $\beta = 0.04$ in practice), and $d_{\text{direct}}$ is the geodesic distance under the metric tensor (\ref{eq:metric_block}).
+
+The $\min$ operation creates a binary choice per dimension: for each pair of points, each dimension independently selects whether the direct or involuted path is shorter. This binary choice is the mechanism that defeats the curse.

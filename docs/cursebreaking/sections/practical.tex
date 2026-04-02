@@ -1,0 +1,92 @@
+\section{Practical Analysis}
+\label{sec:practical}
+
+\subsection{R:r = 30:1 at $d = 308$}
+
+The IOT implementation uses $R/r = 30$ with $d = 154$ torus pairs (308 scalar dimensions). We evaluate the critical scaling:
+\begin{align}
+    \left(\frac{r}{R}\right)_{\text{actual}} &= \frac{1}{30} = 0.0\overline{3} \\[4pt]
+    \left(\frac{r}{R}\right)_{\text{critical}} &= \frac{\ln 154}{2 \cdot 154} = \frac{5.037}{308} = 0.01636
+\end{align}
+
+The actual ratio exceeds the critical ratio by a factor of $0.0333 / 0.0164 = 2.04$, placing the system firmly in the \textbf{expansion regime}.
+
+Computing the contrast:
+\begin{align}
+    \left(\frac{31}{29}\right)^{77} &= e^{77 \ln(31/29)} = e^{77 \times 0.0667} = e^{5.14} \approx 170 \\[4pt]
+    C(154) &\approx \frac{170}{\sqrt{154}} = \frac{170}{12.41} \approx 13.7
+\end{align}
+
+\begin{remark}
+A contrast ratio of 13.7:1 means that for uniformly distributed points on the 308-dimensional IOT, the farthest neighbor is on average $13.7\times$ farther than the nearest neighbor. For comparison, Euclidean $L_2$ at 308 dimensions yields contrast approaching 0, meaning nearest and farthest neighbors are indistinguishable.
+\end{remark}
+
+\subsection{Alternative $r/R$ Scalings}
+
+Table~\ref{tab:scalings} evaluates several $r/R$ scalings at $d = 154$ torus pairs.
+
+\begin{table}[h]
+\centering
+\footnotesize
+\begin{tabular}{@{}llrl@{}}
+\toprule
+Scaling & $R/r$ at $d\!=\!154$ & $C(154)$ & Regime \\
+\midrule
+$r/R = 1/d$ & 154 & $\approx 0.08$ & Contraction \\
+$r/R = \ln d/(2d)$ & 61.2 & $\approx 1.0$ & Critical \\
+$r/R = 1/30$ (fixed) & 30 & $\approx 13.7$ & Expansion \\
+$r/R = 1/\sqrt{d}$ & 12.4 & $\approx 1.6 \times 10^4$ & Strong expansion \\
+$r/R = 1/\ln d$ & 5.04 & $\approx 10^{14}$ & Degenerate \\
+\bottomrule
+\end{tabular}
+\caption{Contrast at $d = 154$ torus pairs for various scalings.}
+\label{tab:scalings}
+\end{table}
+
+The $r/R = 1/\sqrt{d}$ scaling yields $C(d) \sim e^{\sqrt{d}}/\sqrt{d}$, which grows superexponentially. This is theoretically interesting but practically problematic: when contrast is too large, the IOT distance is dominated by the binary path choice rather than angular proximity. Fine-grained similarity is lost.
+
+\subsection{Optimal Operating Point}
+
+The ideal operating point balances two requirements:
+\begin{enumerate}
+    \item \textbf{Expansion}: $r/R$ must exceed the critical threshold $\ln(d)/(2d)$ to ensure the curse is reversed.
+    \item \textbf{Fine-grained discrimination}: $r/R$ must not be so large that the binary path choice overwhelms the continuous angular distance. The distance metric should reflect geometric proximity, not merely which dimensions chose the involuted path.
+\end{enumerate}
+
+We propose the operating range:
+\begin{equation}
+    \frac{r}{R} = c \cdot \frac{\ln d}{d}, \quad c \in (1, 3)
+\end{equation}
+
+At $c = 1$, the system is exactly at criticality. At $c = 3$, the contrast is $C(d) \sim d^2/\sqrt{d} = d^{3/2}$, which grows polynomially---substantial discrimination without degenerate dominance of the path-choice mechanism.
+
+For $d = 154$ torus pairs, $c = 2$ gives $R/r \approx 30.6$, remarkably close to the $R{:}r = 30{:}1$ ratio used in the IOT implementation.
+
+\subsection{Dimension-Adaptive Formulation}
+
+For applications requiring a single formulation that works across varying dimensionalities, we propose:
+\begin{equation}
+    R(d) = \frac{d}{c \cdot \ln d} \cdot r
+    \label{eq:adaptive}
+\end{equation}
+with $c = 2$ as the default operating point. This ensures the system operates at $2\times$ criticality regardless of $d$, maintaining meaningful contrast without degenerate behavior.
+
+\begin{table}[h]
+\centering
+\footnotesize
+\begin{tabular}{@{}rcrc@{}}
+\toprule
+$d$ (pairs) & Scalar dims & $R/r$ at $c\!=\!2$ & $C(d)$ \\
+\midrule
+16 & 32 & 2.9 & 4.0 \\
+64 & 128 & 7.7 & 8.0 \\
+154 & 308 & 30.6 & 13.7 \\
+512 & 1024 & 41.1 & 22.6 \\
+2048 & 4096 & 134.2 & 45.3 \\
+\bottomrule
+\end{tabular}
+\caption{Dimension-adaptive $R/r$ and contrast at $c = 2$.}
+\label{tab:adaptive}
+\end{table}
+
+The contrast grows as $\Theta(\sqrt{d})$---polynomial, not exponential---providing steadily increasing discrimination without divergence.

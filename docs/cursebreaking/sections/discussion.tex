@@ -1,0 +1,41 @@
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{Why the Sphere Fails and the Torus Doesn't}
+
+The curse of dimensionality is often presented as a property of ``high-dimensional spaces.'' Our analysis reveals it as a property of \emph{symmetric} high-dimensional spaces. The $d$-sphere has $O(d)$ symmetry: all directions from the center are equivalent. This symmetry forces volume to concentrate uniformly on the equatorial shell, leaving no geometric structure for distance metrics to exploit.
+
+The $d$-torus has a fundamentally different symmetry group: $U(1)^d$. Each dimension has its own rotational symmetry, but the embedding metric $(R + r\cos v)$ breaks the equivalence between inner and outer edges. This broken symmetry creates a \emph{directional} volume gradient that grows exponentially with $d$. The involution connects the gradient's endpoints, creating a geometric structure that enriches rather than impoverishes the distance function.
+
+\subsection{Relationship to Locality-Sensitive Hashing}
+
+Locality-sensitive hashing (LSH)~\cite{indyk1998approximate} addresses the curse by constructing hash functions that map nearby points to the same bucket with high probability. The hash functions are typically random projections---dimensionality reduction by random linear maps.
+
+The IOT binary path choice $(X_1, X_2, \ldots, X_d) \in \{0,1\}^d$ can be viewed as a \emph{geometric} hash function. Two points that are close on the IOT will tend to make similar path choices (both using the direct path or both using the involuted path in each dimension), producing similar binary signatures. But unlike random projections, this hash is derived from the intrinsic geometry of the manifold rather than from random linear algebra. It preserves the full distance information rather than projecting it away.
+
+\subsection{Relationship to Product Quantization}
+
+Product quantization (PQ)~\cite{jegou2011product} decomposes high-dimensional vectors into subspaces, quantizes each independently, and approximates distances by summing per-subspace distances. The IOT metric has a similar decomposition---distance is computed per torus copy and summed---but with the critical addition of the involution, which creates the binary path choice that PQ lacks.
+
+PQ reduces memory and computation but does not address the fundamental concentration of measure. IOT addresses concentration directly by operating on a manifold where it doesn't occur.
+
+\subsection{Limitations}
+
+\begin{enumerate}
+    \item \textbf{Decorrelation bound}: Theorem~\ref{thm:decorrelation} assumes points are in ``distinct regions'' ($d_{\text{direct}} > \delta$). For very close points, the path choices may be correlated, reducing the anti-curse effect. A complete analysis requires quantifying what fraction of point pairs fall below this threshold in practical distributions.
+
+    \item \textbf{Data distribution}: The analysis assumes uniformly distributed points on the torus. Real data on IOT manifolds may have non-uniform distributions that alter the effective contrast. However, the fundamental mechanism---decorrelation via binary path choice---is distribution-independent.
+
+    \item \textbf{Warping and rotation}: The full Rotating Involuted Oblate Toroid (RIOT) framework~\cite{gaddr2025ppf} includes harmonic warping and rotation coupling terms (Section~\ref{sec:iot_metric}) that are omitted from this analysis. These terms add position-dependent curvature that may further strengthen the decorrelation effect, but rigorous analysis is deferred.
+
+    \item \textbf{Embedding}: Mapping real-world data onto the IOT requires an embedding function. The quality of nearest-neighbor search depends on this embedding preserving meaningful similarity relationships, which is application-dependent.
+\end{enumerate}
+
+\subsection{Implications for ANN Search}
+
+If the theoretical predictions hold empirically, the implications for approximate nearest-neighbor search are significant:
+\begin{itemize}
+    \item ANN indices (HNSW~\cite{malkov2018hnsw}, IVF, etc.) operating on IOT-embedded data should maintain recall at dimensionalities where the same algorithms on Euclidean data have degenerated to random retrieval.
+    \item The common practice of dimensionality reduction before ANN search may be unnecessary or counterproductive on IOT manifolds: higher dimensions provide \emph{more} discrimination, not less.
+    \item The $R{:}r$ ratio becomes a tunable parameter that trades off discrimination strength against fine-grained resolution, analogous to the temperature parameter in softmax attention.
+\end{itemize}

@@ -435,11 +435,20 @@ Expected<void> IndexSparseIOT::add_batch(std::span<const VectorId> ids,
         impl_->select_pivots(impl_->params.n_pivots);
         impl_->recompute_signatures();
     } else if (!impl_->pivots.empty()) {
-        // Compute signatures for new vectors
-        impl_->signatures.reserve(impl_->vectors.size());
+        // Compute signatures for new vectors in parallel
+        const uint32_t n_new = static_cast<uint32_t>(impl_->vectors.size()) - base_idx;
+        const size_t old_sig_size = impl_->signatures.size();
+        impl_->signatures.resize(old_sig_size + n_new);
+
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(dynamic, 256) if(n_new > 256)
+#endif
+        for (int64_t i = 0; i < static_cast<int64_t>(n_new); ++i) {
+            impl_->signatures[old_sig_size + static_cast<size_t>(i)] =
+                impl_->compute_signature(impl_->vectors[base_idx + static_cast<uint32_t>(i)].vec);
+        }
+
         for (uint32_t i = base_idx; i < impl_->vectors.size(); ++i) {
-            impl_->signatures.push_back(
-                impl_->compute_signature(impl_->vectors[i].vec));
             impl_->pending_indices.push_back(i);
         }
 

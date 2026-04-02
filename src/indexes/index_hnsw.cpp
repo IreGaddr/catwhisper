@@ -494,7 +494,13 @@ struct IndexHNSW::Impl {
             query_i8.resize(dimension);
             quantize_f32_to_i8(query, query_i8.data(), dimension, int8_scale);
         }
+        const uint32_t n_vec = static_cast<uint32_t>(n_vectors);
         auto node_dist = [&](uint32_t node_id) -> float {
+            if (node_id >= n_vec) {
+                fprintf(stderr, "HNSW search_layer: node_id %u >= n_vectors %u (layer=%u, ef=%u)\n",
+                                 node_id, n_vec, layer, ef);
+                std::abort();
+            }
             if (int16_mode) return distance_int16_query(query_i16, query_norm_sq_i16, node_id);
             if (int8_mode)  return distance_int8_preq(query_i8.data(), node_id);
             if (bf16_mode)  return distance_bf16(query, node_id);
@@ -512,14 +518,24 @@ struct IndexHNSW::Impl {
             auto [c_dist, c_id] = candidates.top();
             candidates.pop();
 
-            // Don't terminate early - explore all reachable candidates for better recall
-            // Original: if (c_dist > f_dist && results.size() >= ef) break;
+            float f_dist = results.empty() ? INFINITY : results.top().first;
+            if (c_dist > f_dist && results.size() >= ef) break;
 
             if (build_locks == nullptr) {
+                if (c_id >= nodes.size()) {
+                    fprintf(stderr, "HNSW search_layer: c_id %u >= nodes.size() %zu (layer=%u)\n",
+                                     c_id, nodes.size(), layer);
+                    std::abort();
+                }
                 const Node& node = nodes[c_id];
                 if (layer >= node.neighbors.size()) continue;
 
                 for (uint32_t neighbor : node.neighbors[layer]) {
+                    if (neighbor >= n_vec) {
+                        fprintf(stderr, "HNSW search_layer: neighbor %u >= n_vectors %u from node %u layer %u\n",
+                                         neighbor, n_vec, c_id, layer);
+                        std::abort();
+                    }
                     if (visited.count(neighbor)) continue;
                     visited.insert(neighbor);
 
@@ -1566,7 +1582,7 @@ Expected<SearchResults> IndexHNSW::search(Vector query, uint32_t k) {
         }
     }
 
-    uint32_t ef = std::max(ef_search_, k);
+    uint32_t ef = ef_search_;
     auto final_results = impl_->search_layer(query.data(), 0, ef, ep_set);
 
     uint32_t actual_k = std::min(k, static_cast<uint32_t>(final_results.size()));
@@ -1644,7 +1660,7 @@ void IndexHNSW::search_single_locked(const float* query, uint32_t k, SearchResul
         }
     }
 
-    uint32_t ef = std::max(ef_search_, k);
+    uint32_t ef = ef_search_;
     auto final_results = impl_->search_layer(query, 0, ef, ep_set);
 
     uint32_t actual_k = std::min(k, static_cast<uint32_t>(final_results.size()));
@@ -1731,6 +1747,11 @@ Expected<SearchResults> IndexHNSW::search_int16(std::span<const int16_t> queries
 
 void IndexHNSW::search_single_locked_int16(const int16_t* query, int64_t query_norm_sq,
                                              uint32_t k, SearchResult* out) {
+    if (impl_->entry_point >= impl_->n_vectors) {
+        fprintf(stderr, "HNSW search_single_locked_int16: entry_point %u >= n_vectors %lu\n",
+                         impl_->entry_point, impl_->n_vectors);
+        std::abort();
+    }
     std::vector<uint32_t> ep_set = {impl_->entry_point};
 
     for (int lc = static_cast<int>(impl_->max_level); lc > 0; --lc) {
@@ -1741,14 +1762,23 @@ void IndexHNSW::search_single_locked_int16(const int16_t* query, int64_t query_n
         }
     }
 
-    uint32_t ef = std::max(ef_search_, k);
+    // ef_search_ is the explicit search quality budget.  When set low
+    // (e.g. 64 for babble), honour it even if k > ef_search_ — the caller
+    // gets fewer results but the search stays within budget.
+    uint32_t ef = ef_search_;
     auto final_results = impl_->search_layer(nullptr, 0, ef, ep_set, nullptr,
                                               query, query_norm_sq);
 
     uint32_t actual_k = std::min(k, static_cast<uint32_t>(final_results.size()));
     for (uint32_t i = 0; i < actual_k; ++i) {
+        const uint32_t node_id = final_results[i].second;
+        if (node_id >= impl_->id_mapping.size()) {
+            fprintf(stderr, "HNSW search_single_locked_int16: result node_id %u >= id_mapping.size() %zu\n",
+                             node_id, impl_->id_mapping.size());
+            std::abort();
+        }
         out[i].distance = final_results[i].first;
-        out[i].id = impl_->id_mapping[final_results[i].second];
+        out[i].id = impl_->id_mapping[node_id];
     }
 }
 

@@ -1,0 +1,55 @@
+\section{Preliminaries}
+\label{sec:preliminaries}
+
+\subsection{The Curse in Euclidean Space}
+
+Let $X_1, \ldots, X_n$ be iid random points in $\mathbb{R}^d$ drawn from a distribution with density $f$. For a query point $q$, define:
+\begin{align}
+    D_{\min} &= \min_{i} \|q - X_i\|_p \\
+    D_{\max} &= \max_{i} \|q - X_i\|_p
+\end{align}
+
+Beyer et al.~\cite{beyer1999curse} proved that if $\text{Var}[\|X\|_p^p]$ grows slower than $(\mathbb{E}[\|X\|_p^p])^2$, then:
+\begin{equation}
+    \frac{D_{\max} - D_{\min}}{D_{\min}} \xrightarrow{p} 0 \quad \text{as } d \to \infty
+    \label{eq:beyer}
+\end{equation}
+
+For iid coordinates with bounded moments, $\mathbb{E}[\|X\|_2^2] = d\mu$ and $\text{Var}[\|X\|_2^2] = d\sigma^2$, so the ratio $\text{Var}/\mathbb{E}^2 = \sigma^2/(d\mu^2) \to 0$. The condition is satisfied, and (\ref{eq:beyer}) holds.
+
+\subsection{Geometric Interpretation: Spherical Volume Collapse}
+
+The volume of the $d$-sphere of radius $r$ is:
+\begin{equation}
+    V_d(r) = \frac{\pi^{d/2}}{\Gamma(d/2 + 1)} r^d
+\end{equation}
+
+The ratio to the bounding $d$-cube of side $2r$:
+\begin{equation}
+    \frac{V_d(r)}{(2r)^d} = \frac{\pi^{d/2}}{2^d \, \Gamma(d/2 + 1)} \to 0 \quad \text{as } d \to \infty
+    \label{eq:volume_collapse}
+\end{equation}
+
+By Stirling's approximation, $\Gamma(d/2 + 1) \approx \sqrt{\pi d}\,(d/(2e))^{d/2}$, so the ratio decays as $(e\pi/d)^{d/2}/\sqrt{\pi d}$---exponentially in $d$. The sphere's volume concentrates in an exponentially thin equatorial shell of width $O(1/\sqrt{d})$.
+
+\subsection{Archimedes' Projection}
+
+Archimedes proved that the volume of a 3-sphere equals $2/3$ the volume of its bounding cylinder by demonstrating that horizontal cross-sections of (sphere + cone) equal horizontal cross-sections of the cylinder. This \emph{triangular projection}---the cone's linearly growing cross-section compensating for the sphere's sublinearly decaying one---works exactly in 3 dimensions.
+
+In $d$ dimensions, the analogous $d$-cone has volume $r^d h/(d+1)$. The $1/(d+1)$ factor grows without bound, destroying the compensation. The triangular projection fails, and the sphere's volume collapses relative to the cylinder.
+
+\subsection{The Torus as Wrapped Cylinder}
+
+A cylinder $S^1 \times [0, h]$ with identified ends ($0 \sim h$) is a torus $T^2 = S^1 \times S^1$. The torus inherits the cylinder's metric but gains a topological property the cylinder lacks: every geodesic wraps, creating a compact manifold with no boundary.
+
+The standard torus with major radius $R$ and minor radius $r$ embedded in $\mathbb{R}^3$ has the metric:
+\begin{equation}
+    ds^2 = (R + r\cos v)^2 \, du^2 + r^2 \, dv^2
+    \label{eq:torus_metric}
+\end{equation}
+where $u \in [0, 2\pi)$ is the major angle and $v \in [0, 2\pi)$ is the minor angle. The volume element is:
+\begin{equation}
+    dV = r(R + r\cos v) \, du \, dv
+\end{equation}
+
+Crucially, this volume element is \textbf{position-dependent}: it varies by a factor of $(R+r)/(R-r)$ between the outer edge ($v = 0$) and inner edge ($v = \pi$). This asymmetry is the geometric lever that the IOT metric exploits.

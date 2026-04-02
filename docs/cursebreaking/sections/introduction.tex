@@ -1,0 +1,36 @@
+\section{Introduction}
+\label{sec:introduction}
+
+The curse of dimensionality, first identified by Bellman~\cite{bellman1961adaptive} and formalized for nearest-neighbor search by Beyer et al.~\cite{beyer1999curse}, states that as dimension $d$ increases, the ratio of the farthest to nearest neighbor distance converges to unity:
+\begin{equation}
+    \frac{D_{\max} - D_{\min}}{D_{\min}} \to 0 \quad \text{as } d \to \infty
+\end{equation}
+under broad conditions on the data distribution and distance metric. This result is widely cited as a fundamental barrier: in high dimensions, all points are approximately equidistant, rendering nearest-neighbor search meaningless regardless of algorithm or index structure~\cite{aggarwal2001surprising}.
+
+The standard interpretation is computational: high-dimensional spaces are inherently hostile to similarity search. Decades of work on approximate nearest neighbor (ANN) algorithms~\cite{malkov2018hnsw,jegou2011product,dasgupta2008random} have focused on practical workarounds---dimensionality reduction, locality-sensitive hashing~\cite{indyk1998approximate}, graph-based indices---that accept the curse as given and attempt to mitigate its effects.
+
+We argue that this interpretation conflates two distinct claims:
+\begin{enumerate}
+    \item The \emph{Euclidean hypersphere} concentrates volume in high dimensions, causing distance concentration.
+    \item \emph{All} high-dimensional metric spaces exhibit distance concentration.
+\end{enumerate}
+
+Claim (1) is true and well-proven~\cite{vershynin2018high}. Claim (2) is false. The curse of dimensionality is not a property of high-dimensional spaces in general---it is a property of the \emph{spherical geometry} that Euclidean and cosine metrics implicitly assume. On a different manifold, with a different metric tensor, the volume concentration phenomenon can be slowed, neutralized, or reversed.
+
+This paper proves that the Involuted Oblate Toroid (IOT) metric~\cite{gaddr2025ppf} defines a family of Riemannian manifolds parameterized by a radius ratio $\kappa = R/r$ on which distance contrast is a function of both dimension and $\kappa$. We derive a critical scaling law:
+\begin{equation}
+    \left(\frac{r}{R}\right)_{\text{critical}} = \frac{\ln d}{2d}
+\end{equation}
+that separates three regimes: dimensional contraction (the curse), dimensional neutralization (constant contrast), and dimensional expansion (the anti-curse). We show that the $R{:}r = 30{:}1$ ratio at $d = 308$ operates firmly in the expansion regime, with a contrast ratio of approximately 13.7:1.
+
+The result connects Archimedes' classical sphere-cylinder correspondence~\cite{archimedes_sphere} to high-dimensional geometry through a chain of observations: the sphere's volume can be understood via triangular projection onto a cylinder; a torus is a cylinder with identified ends; and the involute of a torus creates a metric space whose volume element grows rather than shrinks with dimension, provided the radii are coupled at or above the critical ratio.
+
+\subsection{Contributions}
+
+\begin{enumerate}
+    \item We identify the \emph{geometric} root of the curse of dimensionality as spherical volume concentration, separating it from the \emph{dimensional} claim that all high-dimensional spaces are cursed (Section~\ref{sec:preliminaries}).
+    \item We prove that the IOT metric creates an exponentially growing volume gradient between the outer and inner edges of the $d$-dimensional toroidal manifold (Theorem~\ref{thm:volume_gradient}).
+    \item We prove that the IOT involution decorrelates pairwise distances, defeating the correlation mechanism that causes Euclidean distance concentration (Theorem~\ref{thm:decorrelation}).
+    \item We derive the critical scaling law $r/R = \ln(d)/(2d)$ and characterize the three regimes (Theorem~\ref{thm:critical_scaling}).
+    \item We provide a dimension-adaptive formulation that maintains expansion at arbitrary $d$ (Section~\ref{sec:practical}).
+\end{enumerate}

@@ -1,0 +1,59 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric}
+\usepackage{subcaption}
+\usepackage{mathtools}
+\usepackage{bm}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{remark}{Remark}[section]
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{A Dimensional Curse Broken:\\Flipping on the Fractal Switch}
+
+\author{
+\IEEEauthorblockN{Ire Gaddr}
+\IEEEauthorblockA{Independent Researcher\\Little Elm, TX, USA\\
+iregaddr@gmail.com}
+}
+
+\maketitle
+
+\begin{abstract}
+The curse of dimensionality---the phenomenon where distance metrics lose discriminative power as dimension increases---is widely regarded as a fundamental barrier to nearest-neighbor search in high-dimensional spaces. We show that this barrier is not fundamental but geometric: it arises from the volume concentration properties of the hypersphere, and can be reversed by operating on a different manifold. Specifically, we prove that the Involuted Oblate Toroid (IOT) metric~\cite{gaddr2025ppf}, which computes distances on a $d$-dimensional toroidal manifold with coupled radii and an involution symmetry, admits a critical scaling $r/R = \ln(d)/(2d)$ that separates two regimes: below this threshold, distance contrast decays with dimension (the curse); above it, contrast \emph{grows} with dimension (the anti-curse). The mechanism is twofold: (1) the torus metric creates a position-dependent volume gradient that grows exponentially with dimension, and (2) the involution bridges volume-rich and volume-poor regions, creating a per-dimension binary path choice that decorrelates pairwise distances---precisely the correlation structure that the curse exploits. For the ratio $R{:}r = 30{:}1$ at $d = 308$ dimensions (154 torus pairs), the IOT metric operates at $2\times$ the critical threshold, yielding a distance contrast ratio of approximately 13.7:1 where Euclidean $L_2$ contrast approaches zero. We derive the critical scaling law, characterize the three regimes (contraction, neutralization, expansion), and provide a dimension-adaptive formulation $r/R = c \cdot \ln(d)/d$ with $c \in (1,3)$ that maintains meaningful nearest-neighbor discrimination at arbitrary dimensionality.
+\end{abstract}
+
+\begin{IEEEkeywords}
+curse of dimensionality, nearest neighbor search, torus geometry, involute, high-dimensional metric, volume concentration, ANN search
+\end{IEEEkeywords}
+
+\input{sections/introduction}
+\input{sections/preliminaries}
+\input{sections/iot_metric}
+\input{sections/volume_gradient}
+\input{sections/involution}
+\input{sections/critical_scaling}
+\input{sections/practical}
+\input{sections/discussion}
+\input{sections/conclusion}
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}

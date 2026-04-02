@@ -1,0 +1,52 @@
+\section{Distance Decorrelation via Involution}
+\label{sec:involution}
+
+The curse of dimensionality operates through a specific mechanism: as $d$ grows, the squared distances $\|q - a\|^2$ and $\|q - b\|^2$ from a query $q$ to two database points $a, b$ become asymptotically \emph{perfectly correlated}. Both are dominated by $\|q\|^2$, and the point-specific terms vanish in the noise. When all distances are correlated, they concentrate.
+
+The IOT involution breaks this correlation.
+
+\begin{theorem}[Distance Decorrelation]
+\label{thm:decorrelation}
+Let $q, a, b$ be three points sampled uniformly on the $d$-dimensional IOT. Define per-dimension indicators:
+\begin{align}
+    X_i^a &= \begin{cases} 1 & \text{if involuted path shorter for $(q, a)$ in dim $i$} \\ 0 & \text{otherwise} \end{cases} \\
+    X_i^b &= \begin{cases} 1 & \text{if involuted path shorter for $(q, b)$ in dim $i$} \\ 0 & \text{otherwise} \end{cases}
+\end{align}
+
+For $a$ and $b$ in distinct regions of the torus (formally, $d_{\text{direct}}(a, b) > \delta$ for some $\delta > 0$), the indicators $X_i^a$ and $X_i^b$ are approximately independent:
+\begin{equation}
+    \mathbb{E}[X_i^a X_i^b] \approx \mathbb{E}[X_i^a] \cdot \mathbb{E}[X_i^b] = p^2
+\end{equation}
+where $p \in (0, 1)$ is the probability that the involuted path is shorter for a random point pair.
+\end{theorem}
+
+\begin{proof}[Proof sketch]
+Whether the involuted path is shorter for $(q, a)$ in dimension $i$ depends on the relative positions of $q_i, a_i$ on the $i$-th torus copy. Specifically, $X_i^a = 1$ when $a_i$ is in the ``involuted neighborhood'' of $q_i$---the set of points whose involute is closer to $q_i$ than they are directly.
+
+For a different point $b$, the event $X_i^b = 1$ depends on whether $b_i$ is in the involuted neighborhood of $q_i$. Since $a_i$ and $b_i$ are in different positions on the torus (guaranteed by $d_{\text{direct}}(a,b) > \delta$), their membership in the involuted neighborhood is determined by independent geometric conditions. The per-dimension indicators inherit this independence.
+\end{proof}
+
+\subsection{Consequence: Variance Preservation}
+
+In Euclidean space, the covariance between $d_E(q,a)^2$ and $d_E(q,b)^2$ is $O(d)$, the same order as the variance. The correlation $\rho \to 1$ as $d \to \infty$.
+
+In IOT space, the covariance includes a term proportional to:
+\begin{equation}
+    \text{Cov}[d_{\text{IOT}}^2(q,a), \, d_{\text{IOT}}^2(q,b)] \propto d(\mu_D - \mu_I)^2 [\mathbb{E}[X_i^a X_i^b] - p^2]
+\end{equation}
+where $\mu_D$ and $\mu_I$ are the mean per-dimension distance contributions for direct and involuted paths respectively.
+
+By the decorrelation theorem, $\mathbb{E}[X_i^a X_i^b] - p^2 \approx 0$, so:
+\begin{equation}
+    \text{Cov}[d_{\text{IOT}}^2(q,a), \, d_{\text{IOT}}^2(q,b)] \approx 0
+\end{equation}
+
+With uncorrelated distances, the gap $D_{\max} - D_{\min}$ over $n$ points follows extreme value statistics for \emph{independent} random variables rather than correlated ones, preserving $O(\sqrt{d \log n})$ separation.
+
+\subsection{The Binary Path Choice}
+
+The involution introduces a fundamentally new degree of freedom in high-dimensional distance computation. For each pair of points $(q, a)$, each dimension makes an independent binary choice: direct or involuted path. The vector of choices $(X_1^a, X_2^a, \ldots, X_d^a) \in \{0, 1\}^d$ is a $d$-bit signature of the geometric relationship between $q$ and $a$.
+
+Two points $a$ and $b$ at the same Euclidean distance from $q$ will generally have \emph{different} binary signatures, making their IOT distances different. This is exactly the discrimination that Euclidean distance loses in high dimensions.
+
+The number of distinct signatures is $2^d$, which grows exponentially. Even at $d = 154$, this provides $2^{154} \approx 10^{46}$ distinct geometric relationships---far more than any practical dataset size. The signature space does not saturate.

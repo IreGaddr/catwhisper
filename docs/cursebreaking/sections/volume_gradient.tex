@@ -1,0 +1,44 @@
+\section{Exponential Volume Gradient}
+\label{sec:volume_gradient}
+
+\begin{theorem}[Volume Gradient Growth]
+\label{thm:volume_gradient}
+The ratio of the volume element at the outer edge to the volume element at the inner edge of the $d$-dimensional IOT grows exponentially with $d$:
+\begin{equation}
+    \frac{dV_{\text{outer}}}{dV_{\text{inner}}} = \left(\frac{R+r}{R-r}\right)^d
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+At the outer edge, all $v_i = 0$. The volume element is:
+\begin{equation}
+    dV_{\text{outer}} = \prod_{i=1}^{d} r(R + r) \, du_i \, dv_i = [r(R+r)]^d \prod_{i} du_i \, dv_i
+\end{equation}
+
+At the inner edge, all $v_i = \pi$:
+\begin{equation}
+    dV_{\text{inner}} = \prod_{i=1}^{d} r(R - r) \, du_i \, dv_i = [r(R-r)]^d \prod_{i} du_i \, dv_i
+\end{equation}
+
+The ratio is:
+\begin{equation}
+    \frac{dV_{\text{outer}}}{dV_{\text{inner}}} = \left(\frac{R+r}{R-r}\right)^d
+\end{equation}
+\end{proof}
+
+For $R/r = 30$, this ratio is $(31/29)^d \approx 1.069^d$, which at $d = 154$ gives:
+\begin{equation}
+    \left(\frac{31}{29}\right)^{154} \approx 2.88 \times 10^4
+\end{equation}
+
+The outer edge of the $d$-torus contains approximately $10^4$ times more volume than the inner edge. This is in stark contrast to the $d$-sphere, where volume concentrates \emph{uniformly} on the equatorial shell with no directional gradient.
+
+\begin{remark}
+On the $d$-sphere, volume concentration is symmetric---the shell is equatorial. On the $d$-torus, volume concentration is \emph{directional}---it flows from inner to outer edge. This directional gradient is what the involution exploits: it provides a ``return path'' from volume-poor to volume-rich regions that has no analogue on the sphere.
+\end{remark}
+
+\subsection{Contrast with Spherical Concentration}
+
+The sphere concentrates volume but does so uniformly: all equatorial directions are equivalent. A query point on the equatorial shell is surrounded by a thin, high-volume region, and all database points crowd into this same region. The result is that all distances converge.
+
+The torus concentrates volume directionally: the outer edge is exponentially more voluminous than the inner edge. A query at the outer edge sees many nearby points; a query at the inner edge sees few. But the involution connects these two regions, creating a structured distance distribution rather than a concentrated one.
